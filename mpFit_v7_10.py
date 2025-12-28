@@ -40,6 +40,26 @@ units (ppm/Hz), set reference frequency if needed, then:
 - Use "Auto-Pick" (optional) to detect top N peaks.
 - "Save CSV" writes parameters and fit metrics to a CSV.
 
+Design
+------
+The design centers around the ParamRef objects.
+
+When user make a peak, either by click on plot or add one in a table, or import from a table, a Peak object is created.
+Peak object --> Peaks[List] aka a list of Peaks
+Peaks[List] <--> Peak <--> ParamRef object <--> key <--> lmfit.Parameter object -> lmfit.Parameters object
+
+For 2D data, --> multi slice. the data of each slice () is cached in a FitSliceState object.
+
+When creating a link between fitting parameters (e.g s0_p0_pos = s1_p0_pos), the link is a linkExpr object. The object and alike are stored in linkStore. 
+Fetching linkStore gives linkExpr and ParamRef. Use ParamRef to call Parameter object from Parameters. Use linkExpr to find a link expression of a Parameter object.
+Use Parameter.set() to set an expression and forward that to lmfit.minimize()
+In short, User set a link --> LinkExpr <--> LinkStore --> ParamRef --> lmfit.Parameter --> lmfit.Parameters --> lmfit.minimize()
+
+When setting a bound of a fitting parameter (e.g 90 < s0_p0_pos < 100 ppm).
+
+ 
+
+
 Copyright
 ---------
 This script is for research/educational use.
@@ -65,7 +85,7 @@ from peak_table_io_v3 import export_peak_table, import_peak_table
 import numpy as np
 from numpy.fft import fft, fftfreq, fftshift
 
-from lmfit import Parameters, minimize, fit_report, report_fit
+from lmfit import Parameters, Parameter, minimize, fit_report, report_fit
 
 from PyQt5 import QtCore, QtWidgets, QtGui
 from PyQt5.QtCore import Qt
@@ -2763,6 +2783,30 @@ def Peaks_to_PeaksHz(self, peaks):
         return peaks_hz
     return peaks
 
+def Bounds_to_BoundsHz(lo, hi, pref_name: str, axis_mode: str, ref_mhz: float):
+    """Return (lo_int, hi_int) in internal Hz units, given display-unit bounds."""
+    # pass-through if nothing set
+    if lo is None and hi is None:
+        return None, None
+
+    def conv(v):
+        if v is None:
+            return None
+        if axis_mode.lower() == "ppm" and pref_name in ("pos", "gauss"):
+            # pos, gauss are shown in ppm when axis_mode == 'ppm'
+            return float(ppm_to_hz(float(v), ref_mhz))
+        # lor (Hz) and amp (arb.) are already in internal units
+        return float(v)
+
+    lo_i = conv(lo)
+    hi_i = conv(hi)
+
+    # if both set and inverted after conversion, swap them, just in case. 
+    # It should never happen because BoundsDialog._on_ok() make sure that the input has hi > lo and ref_mhz is positive
+    if (lo_i is not None) and (hi_i is not None) and (lo_i > hi_i):
+        lo_i, hi_i = hi_i, lo_i
+    return lo_i, hi_i
+
 
 def calc_sw_hz(x_hz: np.ndarray) -> float:
     # Approximate SW from displayed window width.
@@ -3041,14 +3085,14 @@ class FitContext:
 
         for i, pk in enumerate(peaks):
             if self.axis_mode.lower() == 'ppm':
-                p.add(f'{pre}pos_{i}',   value=float(ppm_to_hz(pk.pos, self.ref)))
-                p.add(f'{pre}gauss_{i}', value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
+                p.add(f'{pre}p{i}_pos',   value=float(ppm_to_hz(pk.pos, self.ref)))
+                p.add(f'{pre}p{i}_gauss', value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
             else:
-                p.add(f'{pre}pos_{i}',   value=float(pk.pos))
-                p.add(f'{pre}gauss_{i}', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
+                p.add(f'{pre}p{i}_pos',   value=float(pk.pos))
+                p.add(f'{pre}p{i}_gauss', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
                 
-            p.add(f'{pre}amp_{i}',   value=max(1e-9, float(pk.amp)), min=0.0)
-            p.add(f'{pre}lor_{i}',   value=max(1.0, float(pk.lor_hz)), min=0.0)
+            p.add(f'{pre}p{i}_amp',   value=max(1e-9, float(pk.amp)), min=0.0)
+            p.add(f'{pre}p{i}_lor',   value=max(1.0, float(pk.lor_hz)), min=0.0)
 
         return p
 
@@ -3152,31 +3196,7 @@ class FitContext:
 
         return res / sigma
     
-def _convert_bounds_to_hz(lo, hi, pref_name: str, axis_mode: str, ref_mhz: float):
-    """Return (lo_int, hi_int) in internal Hz units, given display-unit bounds."""
-    # pass-through if nothing set
-    if lo is None and hi is None:
-        return None, None
-
-    def conv(v):
-        if v is None:
-            return None
-        if axis_mode.lower() == "ppm" and pref_name in ("pos", "gauss"):
-            # pos, gauss are shown in ppm when axis_mode == 'ppm'
-            return float(ppm_to_hz(float(v), ref_mhz))
-        # lor (Hz) and amp (arb.) are already in internal units
-        return float(v)
-
-    lo_i = conv(lo)
-    hi_i = conv(hi)
-
-    # if both set and inverted after conversion, swap them
-    if (lo_i is not None) and (hi_i is not None) and (lo_i > hi_i):
-        lo_i, hi_i = hi_i, lo_i
-    return lo_i, hi_i
-
-
-def apply_bounds_to_param(par, model, slice_id: int, peak_idx: int,
+def apply_bounds_to_param(par: Parameter, model, slice_id: int, peak_idx: int,
                           pref_name: str, axis_mode: str, ref_mhz: float):
     """Look up and apply bounds for this parameter."""
     if not model:
@@ -3187,7 +3207,7 @@ def apply_bounds_to_param(par, model, slice_id: int, peak_idx: int,
         if not b or (b.lo is None and b.hi is None):
             return
 
-        lo_i, hi_i = _convert_bounds_to_hz(b.lo, b.hi, pref_name, axis_mode, ref_mhz)
+        lo_i, hi_i = Bounds_to_BoundsHz(b.lo, b.hi, pref_name, axis_mode, ref_mhz)
         if lo_i is not None:
             par.min = float(lo_i)
         if hi_i is not None:
@@ -4336,7 +4356,7 @@ class  MainWindow(QMainWindow):
             "gauss": "gauss", "gauss_disp": "gauss",
         }
 
-        for pref_tgt, entry in reg.items():
+        for pref_tgt, entry in reg.items(): #pref_tgt is ParamRef instance
             if not isinstance(pref_tgt, ParamRef):
                 continue
             if int(pref_tgt.slice_id) != int(s):
@@ -5541,12 +5561,12 @@ class  MainWindow(QMainWindow):
             # 3) Build context and LMFit params
             ctx = FitContext(self.x, self.y, self.axis_mode, self.ref, self.sw_hz)
             ctx.mask_w = mask_w
-            params = ctx.build_params(peaks, self.multiplier, self.offset)
+            params = ctx.build_params(peaks, self.multiplier, self.offset, prefix=f's{sid}_') #params is a Paramters instance aka a dictionary
 
             # globals vary/freeze
-            params['mult'].set(vary=not self.fix_mult,    value=self.multiplier)
-            params['phi0_deg'].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params['offset'].set(vary=not self.fix_offset, value=self.offset)        
+            params[f's{sid}_mult'].set(vary=not self.fix_mult,    value=self.multiplier)
+            params[f's{sid}_phi0_deg'].set(vary=not self.fix_phi0, value=self.phi0_deg)
+            params[f's{sid}_offset'].set(vary=not self.fix_offset, value=self.offset)        
 
             for i in range(len(peaks)):
                 apply_bounds_to_param(params[f'pos_{i}'],   self.peak_model, sid, i, "pos",   self.axis_mode, self.ref)
