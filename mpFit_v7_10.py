@@ -75,6 +75,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QDoubleValidator
 
+from stats_extract import extract_FitResult_and_corr
+from stats_view import StatsView
+
 import os
 os.environ["QT_API"] = "pyqt5"
 os.environ["MPLBACKEND"] = "Qt5Agg"
@@ -143,10 +146,11 @@ class SliceFitState:
     offset: float = 0.0
     phi0_deg: float = 0.0
 
-    # optional: last plot view (so you can restore zoom if you want)
+    # optional: last plot view (restore zoom if needed)
     xlim: Optional[Tuple[float,float]] = None
     ylim: Optional[Tuple[float,float]] = None
     redchi: Optional[float] = None
+    state_stats = None
 
 class LinkType(Enum):
     LINEAR = auto()       # target = a * driver + b
@@ -3249,7 +3253,7 @@ class PeakTableModel(QtCore.QAbstractTableModel):
 
     # ---- Public API ----
     def bind_state(self, state):  # state: SliceFitState object
-        """Re-bind the model to a different slice state (no copy)."""
+        """Re-bind the model to a different slice state (no copy). Called when changing/updating slice states"""
         self.beginResetModel()
         self._peaks = state.peaks
         self._fix   = state.fix_flags
@@ -3257,14 +3261,14 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         self.endResetModel()
 
     def replace_data(self, peaks, fix_flags, redchi):
-        """Bulk replace (same semantics as bind_state but with explicit lists)."""
+        """Same semantics as bind_state but with explicit lists. Called when information comes from import, fit results, or peak picking"""
         self.beginResetModel()
         self._peaks = peaks
         self._fix   = fix_flags
         self._redchi = redchi
         self.endResetModel()
 
-    def add_peak(self, pk: Peak | None = None,
+    def add_row(self, pk: Peak | None = None,
                  fix_flags: tuple[bool,bool,bool,bool] | None = None,
                  default_fix: dict[str,bool] | None = None):
         """
@@ -3302,13 +3306,7 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         """
         return list(self._peaks), list(self._fix), self._redchi
     
-    # A1: bind LinkStore and a provider for current slice index
-    def bind_links(self, store, *, slice_index_provider=None):
-        self._links = store
-        self._slice_index_provider = slice_index_provider
-        self.layoutChanged.emit()
-
-    # A2: translate a cell into ParamRef
+    # Translate a cell into ParamRef
     def index_to_paramref(self, index):
         if (not index.isValid()) or (index.column() not in self._col_to_name):
             return None
@@ -3333,63 +3331,8 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         if role != QtCore.Qt.DisplayRole: return None
         if orientation == QtCore.Qt.Horizontal: return self.COLS[section]
         return str(section)
-
-    # ---- Column helpers ----
-    @staticmethod
-    def _is_fix_col(col): return col in (1, 3, 5, 7)
-    @staticmethod
-    def _fix_index_for_col(col):
-        # map fix columns → index in (pos, amp, lor, gauss)
-        return {1:0, 3:1, 5:2, 7:3}.get(col, None)
-
-    # ---- Header checkbox helpers (for master fix in header) ----
-    def column_fix_tristate(self, section: int) -> QtCore.Qt.CheckState:
-        fi = self._fix_index_for_col(section)
-        if fi is None or len(self._fix) == 0: return QtCore.Qt.Unchecked
-        checked = sum(1 for t in self._fix if t[fi])
-        if checked == 0: return QtCore.Qt.Unchecked
-        if checked == len(self._fix): return QtCore.Qt.Checked
-        return QtCore.Qt.PartiallyChecked
-
-    def set_all_fix_in_column(self, section: int, checked: bool) -> None:
-        fi = self._fix_index_for_col(section)
-        if fi is None or len(self._fix) == 0: return
-        changed = False
-        newv = bool(checked)
-        for i, t in enumerate(self._fix):
-            if t[fi] != newv:
-                lst = list(t); lst[fi] = newv; self._fix[i] = tuple(lst)
-                changed = True
-        if changed:
-            tl = self.index(0, section)
-            br = self.index(len(self._fix)-1, section)
-            self.dataChanged.emit(tl, br, [QtCore.Qt.CheckStateRole])
-
-        # helper: map view index → ParamRef (you already have index_to_paramref)
-    def get_bounds_for(self, pref: ParamRef) -> ParamBounds:
-        return self._bounds.get(pref, ParamBounds())
     
-    def set_bounds_for(self, pref: ParamRef, lo: float | None, hi: float | None):
-        if lo is None and hi is None:
-            self._bounds.pop(pref, None)
-        else:
-            self._bounds[pref] = ParamBounds(lo, hi)
-    
-    def clear_bounds_for(self, pref: ParamRef):
-        self._bounds.pop(pref, None)
-
-    # ---- Data / Edit ----
-    
-    def _fmt(self, v: float) -> str:
-        if v is None or not math.isfinite(v):
-            return "—"
-        v = float(v)
-        # Switch to scientific for large or tiny values
-        if abs(v) >= 1e6 or (0 < abs(v) < 1e-3):
-            return f"{v:.3e}"   # 3 digits after decimal, scientific notation
-        else:
-            return f"{v:.3f}"   # 3 digits after decimal, fixed notation
-
+        # ---- Data / Edit ----  
     def data(self, index, role=QtCore.Qt.DisplayRole):
         if not index.isValid(): return None
         r, c = index.row(), index.column()
@@ -3421,7 +3364,7 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.TextAlignmentRole:
             return QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
 
-    # A3: show link hint tooltip
+        # Show link hint tooltip
         if role == QtCore.Qt.ToolTipRole and self._links and (c in self._col_to_name):
             tips = []
             # link tip
@@ -3450,7 +3393,7 @@ class PeakTableModel(QtCore.QAbstractTableModel):
 
         return None   
 
-    # A4: make linked targets read-only
+    # Edit policy
     def flags(self, index):
         base = super().flags(index)
         if not index.isValid():
@@ -3491,6 +3434,67 @@ class PeakTableModel(QtCore.QAbstractTableModel):
             return True
 
         return False
+
+    # ---- Column helpers ----
+    @staticmethod
+    def _is_fix_col(col): return col in (1, 3, 5, 7)
+    @staticmethod
+    def _fix_index_for_col(col):
+        # map fix columns → index in (pos, amp, lor, gauss)
+        return {1:0, 3:1, 5:2, 7:3}.get(col, None)
+
+    # ---- Header checkbox helpers (for master fix in header) ----
+    def column_fix_tristate(self, section: int) -> QtCore.Qt.CheckState:
+        fi = self._fix_index_for_col(section)
+        if fi is None or len(self._fix) == 0: return QtCore.Qt.Unchecked
+        checked = sum(1 for t in self._fix if t[fi])
+        if checked == 0: return QtCore.Qt.Unchecked
+        if checked == len(self._fix): return QtCore.Qt.Checked
+        return QtCore.Qt.PartiallyChecked
+
+    def set_all_fix_in_column(self, section: int, checked: bool) -> None:
+        fi = self._fix_index_for_col(section)
+        if fi is None or len(self._fix) == 0: return
+        changed = False
+        newv = bool(checked)
+        for i, t in enumerate(self._fix):
+            if t[fi] != newv:
+                lst = list(t); lst[fi] = newv; self._fix[i] = tuple(lst)
+                changed = True
+        if changed:
+            tl = self.index(0, section)
+            br = self.index(len(self._fix)-1, section)
+            self.dataChanged.emit(tl, br, [QtCore.Qt.CheckStateRole])
+
+    # ---- Format ----
+    def _fmt(self, v: float) -> str:
+        if v is None or not math.isfinite(v):
+            return "—"
+        v = float(v)
+        # Switch to scientific for large or tiny values
+        if abs(v) >= 1e6 or (0 < abs(v) < 1e-3):
+            return f"{v:.3e}"   # 3 digits after decimal, scientific notation
+        else:
+            return f"{v:.3f}"   # 3 digits after decimal, fixed notation
+   
+    # Bind LinkStore and a provider for current slice index to link parameters
+    def bind_links(self, store, *, slice_index_provider=None):
+        self._links = store
+        self._slice_index_provider = slice_index_provider
+        self.layoutChanged.emit()
+    # Set bound for parameters
+    def get_bounds_for(self, pref: ParamRef) -> ParamBounds:
+        return self._bounds.get(pref, ParamBounds())
+    
+    def set_bounds_for(self, pref: ParamRef, lo: float | None, hi: float | None):
+        if lo is None and hi is None:
+            self._bounds.pop(pref, None)
+        else:
+            self._bounds[pref] = ParamBounds(lo, hi)
+    
+    def clear_bounds_for(self, pref: ParamRef):
+        self._bounds.pop(pref, None)
+    
 
 class ScientificDoubleDelegate(QtWidgets.QStyledItemDelegate):
     def __init__(self, parent=None, *, decimals=12, bottom=None, top=None):
@@ -3737,7 +3741,6 @@ class TSeedTableModel(QtCore.QAbstractTableModel):
 
         if c == 2 and role == QtCore.Qt.CheckStateRole:
             rec["fixed"] = (value == QtCore.Qt.Checked)
-            rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
             self.dataChanged.emit(index, index, [QtCore.Qt.CheckStateRole, QtCore.Qt.DisplayRole])
             return True
         return False
@@ -3907,7 +3910,7 @@ class MplCanvas(FigureCanvas):
 
 
 # ---------------------------- Main GUI window ------------------------------
-class MainWindow(QMainWindow):
+class  MainWindow(QMainWindow):
     @property
     def peaks(self): 
         return self.slice_states[self.slice_index].peaks
@@ -3985,6 +3988,7 @@ class MainWindow(QMainWindow):
         self.default_save_dir = str(Path.home())   # where to start Save dialog
         self.default_open_dir = str(Path.home())   # where to start Open dialog
         self.program_version = "mpFit"
+        
         self.fit_stats = None  # fill after fit
         self.lmfit_fit_report: str | None = None  # last lmfit.fit_report text
         
@@ -5598,6 +5602,7 @@ class MainWindow(QMainWindow):
                     method='least_squares', max_nfev=5000,
                     ftol=1e-8, xtol=1e-8, gtol=1e-8, x_scale='jac', loss='soft_l1'
                 )
+                self.fit_stats = extract_FitResult_and_corr(result)
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, 'Fit error', str(e))
                 return  # finally{} will end_busy()
@@ -5660,27 +5665,12 @@ class MainWindow(QMainWindow):
                 self.peak_model.replace_data(fitted_peaks, fitted_fix, redchi)
             except Exception: pass
 
-            # --- store fit statistics for export / GUI ---
-            try:
-                self.fit_stats = {
-                    "mode": "single",
-                    "slice_indices": [int(sid)],
-                    "redchi": float(getattr(result, "redchi", redchi)),
-                    "aic": float(getattr(result, "aic", float("nan"))),
-                    "bic": float(getattr(result, "bic", float("nan"))),
-                    "ndata": int(getattr(result, "ndata", 0)),
-                    "nvarys": int(getattr(result, "nvarys", 0)),
-                    "nfree": int(getattr(result, "nfree", 0)),
-                }
-                self.lmfit_fit_report = fit_report(result)
-            except Exception as _e:
-                log.warning("Storing single-slice fit statistics failed: %s", _e)
-
             # 10) Save ONLY this slice and refresh
             self._save_slice_state(s, has_fit=True)
             st = self.slice_states.get(s)
             if st is not None:
                 self.refresh_plot_from_state(st, preserve_view=True)
+                st.state_stats = self.fit_stats
 
             # 11) Quick GOF
             if status is True:
@@ -5833,6 +5823,7 @@ class MainWindow(QMainWindow):
                 method='least_squares', max_nfev=5000,
                 ftol=1e-8, xtol=1e-8, gtol=1e-8, loss='soft_l1', x_scale='jac'                
             )
+            self.fit_stats = extract_FitResult_and_corr(result)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, 'Joint Fit error', str(e))
             try: self._end_busy()
@@ -5950,23 +5941,6 @@ class MainWindow(QMainWindow):
                 if dlg: dlg.model.refresh()
             except Exception:
                 pass
-
-                # --- store global joint-fit statistics + full lmfit report ---
-        try:
-            self.fit_stats = {
-                "mode": "joint",
-                "slice_indices": sorted(set(int(i) for i in indices)),
-                "redchi": float(getattr(result, "redchi", float("nan"))),
-                "aic": float(getattr(result, "aic", float("nan"))),
-                "bic": float(getattr(result, "bic", float("nan"))),
-                "ndata": int(getattr(result, "ndata", 0)),
-                "nvarys": int(getattr(result, "nvarys", 0)),
-                "nfree": int(getattr(result, "nfree", 0)),
-            }
-            self.lmfit_fit_report = fit_report(result)
-        except Exception as _e:
-            log.warning("Storing joint-fit statistics failed: %s", _e)
-
 
         try:
             nfev = int(result.nfev)
@@ -6409,62 +6383,18 @@ class MainWindow(QMainWindow):
 
         return params_all, slice_ctxs, report
     
-
-    def on_show_statistics(self) -> None:
-        """Show statistics from the last lmfit fit (single or joint)."""
-        txt = getattr(self, "lmfit_fit_report", None)
-        if not txt:
+    def on_show_statistics(self):
+        stats = getattr(self, "fit_stats", None)
+        if not stats:
             QtWidgets.QMessageBox.information(
-                self, "Statistics", "No fit statistics available.\nRun a fit first."
+                self, "Statistics", "No fit statistics available."
             )
             return
 
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Fit statistics")
-        dlg.resize(720, 540)
-
-        layout = QtWidgets.QVBoxLayout(dlg)
-
-        view = QtWidgets.QPlainTextEdit(dlg)
-        view.setReadOnly(True)
-
-        # Use monospaced font for alignment if available
-        try:
-            font = QtGui.QFont("Helvetica")
-            font.setStyleHint(QtGui.QFont.Monospace)
-            font.setPointSize(12)
-            view.setFont(font)
-        except Exception:
-            pass
-      
-        text = str(txt)
-
-        stats = getattr(self, "fit_stats", None)
-        if isinstance(stats, dict):
-            hdr = []
-            mode = stats.get("mode", "?")
-            slices = stats.get("slice_indices", None)
-            if slices is not None:
-                hdr.append(f"Mode   : {mode} fit")
-                hdr.append(f"Slices : {slices}")
-            for key in ("redchi", "aic", "bic", "ndata", "nvarys", "nfree"):
-                if key in stats and stats[key] is not None:
-                    hdr.append(f"{key} = {stats[key]}")
-            if hdr:
-                text = "[[mpFit summary]]\n" + "\n".join(hdr) + "\n\n" + text
-
-        view.setPlainText(text)
-        layout.addWidget(view)
-
-
-
-        btn_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Close, parent=dlg
-        )
-        btn_box.rejected.connect(dlg.reject)
-        layout.addWidget(btn_box)
-
+        dlg = StatsView(self)
+        dlg.set_stats(stats)
         dlg.exec_()
+
 
     def on_seed_saved(self, T_name: str, T_seconds: float, use_flag: bool):
         # LinkEditor may choose to stash a seed; table remains source of truth.
