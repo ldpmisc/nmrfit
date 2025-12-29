@@ -252,19 +252,18 @@ class LinkManagerDialog(QtWidgets.QDialog):
         s14_p2_amp = s15_p2_amp * A * exp(-0.1/T_name + C)
     """
 
-class LinkManagerDialog(QtWidgets.QDialog):
     COL_ENABLED = 0
     COL_TARGET  = 1
     COL_TYPE    = 2
     COL_DRIVER  = 3
     COL_EXPR    = 4
-    def __init__(self, parent, link_store: LinkStore, *, slice_count_provider=None, peaks_per_slice_provider=None):
+    def __init__(self, parent, link_store: LinkStore, *, slice_count: int = 1, peaks_per_slice: int = 1):
         super().__init__(parent)
         self.setWindowTitle("Link Manager")
         self.resize(1000, 700)
         self._link_store = link_store
-        self._slice_count_provider = slice_count_provider or (lambda: 1)
-        self._peaks_per_slice_provider = peaks_per_slice_provider or (lambda: 1)
+        self._slice_count = slice_count
+        self._peaks_per_slice = peaks_per_slice
         self._row_targets: list[ParamRef] = []
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -628,8 +627,8 @@ class LinkManagerDialog(QtWidgets.QDialog):
         dlg = _GenerateTargetsDialog(
             parent=self,
             source_text=self._fmt_pref(src_pref),
-            max_slices=int(self._slice_count_provider() or 1),
-            max_peaks=int(self._peaks_per_slice_provider() or 1),
+            max_slices=int(self._slice_count),
+            max_peaks=int(self._peaks_per_slice),
             start_row=cur_row + 1,
         )
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
@@ -2433,8 +2432,8 @@ class LinkEditorDialog(QtWidgets.QDialog):
 
 def attach_link_context_menu(view: QtWidgets.QTableView,
                              model: PeakTableModel,
-                             slice_count_provider,
-                             peaks_per_slice_provider, parent=None, **kwargs):
+                             slice_count: int,
+                             peaks_per_slice: int, parent=None, **kwargs):
     """
     Right-click → 'Edit Link…' for the clicked cell.
     """
@@ -2462,8 +2461,8 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
             dlg = LinkEditorDialog(
                 parent or view,
                 target=pref,
-                slice_count=int(slice_count_provider()),
-                peaks_per_slice=int(peaks_per_slice_provider()),
+                slice_count=slice_count,
+                peaks_per_slice=peaks_per_slice,
                 link_store=model._links,
             )
             if dlg.exec_() == QtWidgets.QDialog.Accepted:
@@ -3074,10 +3073,21 @@ def ParamRef_to_key(pref: ParamRef):
     key = f"s{int(pref.slice_id)}_p{int(pref.peak_id)}_{str(pref.name)}"
     return key
 
+def global_ref(sid: int, name: str) -> "ParamRef":
+    # globals still follow the same rule by using peak_id = -1
+    return ParamRef(slice_id=int(sid), peak_id=-1, name=str(name))
 
-
-
-
+def canon_name(n: str) -> str:
+    """Keep this small. Best is: LinkManager only ever stores canonical names."""
+    n = (n or "").strip().lower()
+    # allow backwards-compat / synonyms
+    return {
+        "pos": "pos", "position": "pos", "freq": "pos",
+        "amp": "amp", "area": "amp", "amplitude": "amp",
+        "lor": "lor", "lorentz": "lor", "lor_hz": "lor",
+        "gauss": "gauss", "gau": "gauss", "gaussian": "gauss",
+        "gauss_disp": "gauss", "gauss_display": "gauss",
+    }.get(n, n)
 
 
 # ------------------------------ Fitting core -------------------------------
@@ -3093,28 +3103,30 @@ class FitContext:
         #Parameters always contains pos lor and gauss in Hz
         p = Parameters()
         pre = str(prefix) if prefix else ""
-        p.add(f'{pre}mult', value=float(multiplier), min=0.0)
-        p.add(f'{pre}offset', value=float(offset))
-        p.add(f'{pre}phi0_deg', value=0.0, min=-180.0, max=180.0)
+        p.add(f'{ParamRef_to_key(global_ref(sid, "mult"))}', value=float(multiplier), min=0.0)
+        p.add(f'{ParamRef_to_key(global_ref(sid, "offset"))}', value=float(offset))
+        p.add(f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}', value=0.0, min=-180.0, max=180.0)
 
-        ParamRefList = Peaks_to_ParamRefList(sid, peaks)
-        for pref in ParamRefList:
-            name = ParamRef_to_key(pref)
-            pk = peaks[pref.peak_id]       
-            if pref.name == "pos":
-                if self.axis_mode.lower() == 'ppm':
-                    p.add(f'{name}',   value=float(ppm_to_hz(pk.pos, self.ref)))
-                else:
-                    p.add(f'{name}',   value=float(pk.pos))
-            elif pref.name == "gauss":            
-                if self.axis_mode.lower() == 'ppm':
-                    p.add(f'{name}',   value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
-                else:
-                    p.add(f'{name}', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
-            elif pref.name == "lor":
-                p.add(f'{name}',   value=max(1.0, float(pk.lor_hz)), min=0.0)
-            elif pref.name == "amp":
-                p.add(f'{name}',   value=max(1e-9, float(pk.amp)), min=0.0)
+        for pid in range(len(peaks)):
+            pk = peaks[pid]
+            pref_pos = ParamRef(slice_id=sid, peak_id=pid, name="pos")
+            name_pos = ParamRef_to_key(pref_pos)
+            pref_gauss = ParamRef(slice_id=sid, peak_id=pid, name="gauss")
+            name_gauss = ParamRef_to_key(pref_gauss)
+            if self.axis_mode.lower() == 'ppm':
+                p.add(f'{name_pos}',   value=float(ppm_to_hz(pk.pos, self.ref)))
+                p.add(f'{name_gauss}',   value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
+            else:
+                p.add(f'{name_pos}',   value=float(pk.pos))
+                p.add(f'{name_gauss}', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
+
+            pref_lor = ParamRef(slice_id=sid, peak_id=pid, name="lor")
+            name_lor = ParamRef_to_key(pref_lor)
+            p.add(f'{name_lor}',   value=max(1.0, float(pk.lor_hz)), min=0.0)
+            
+            pref_amp = ParamRef(slice_id=sid, peak_id=pid, name="amp")
+            name_amp = ParamRef_to_key(pref_amp)
+            p.add(f'{name_amp}',   value=max(1e-9, float(pk.amp)), min=0.0)
 
         return p
 
@@ -4226,12 +4238,15 @@ class  MainWindow(QMainWindow):
         self.tbl.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
         right.addWidget(self.tbl, 1)
                 # B1: mount link context menu
+        # Capture slice and peak counts once at initialization (snapshot, not dynamic)
+        _slice_count_snapshot = self._slice_count()
+        _peaks_per_slice_snapshot = self._peaks_per_slice(0)  # Use slice 0 for initialization
         attach_link_context_menu(
             view=self.tbl,
             parent=self,
             model=self.peak_model,
-            slice_count_provider=self._slice_count,
-            peaks_per_slice_provider=lambda: self._peaks_per_slice(getattr(self, "slice_index", 0)),
+            slice_count=_slice_count_snapshot,
+            peaks_per_slice=_peaks_per_slice_snapshot,
             get_target_from_index=self.peak_model.index_to_paramref,
             link_store=self.link_store,
             enable_linear=True,
@@ -4553,11 +4568,14 @@ class  MainWindow(QMainWindow):
         return True
     
     def on_show_link_manager(self):
+        # Capture counts once at dialog creation time (snapshot)
+        _slice_count_snapshot = self._slice_count()
+        _peaks_per_slice_snapshot = self._peaks_per_slice(getattr(self, "slice_index", 0))
         dlg = LinkManagerDialog(
             self,
             self.link_store,
-            slice_count_provider=self._slice_count,
-            peaks_per_slice_provider=lambda: self._peaks_per_slice(getattr(self, "slice_index", 0)),
+            slice_count=_slice_count_snapshot,
+            peaks_per_slice=_peaks_per_slice_snapshot,
         )
         dlg.exec_()
         # after user edits links, refresh current table so tooltips / gray text update
@@ -5994,6 +6012,8 @@ class  MainWindow(QMainWindow):
             try: self._end_busy()
             except Exception: pass
 
+
+
     def _build_joint_params(self, indices):
         """
         Build joint lmfit.Parameters and per-slice contexts for the selected slices.
@@ -6020,37 +6040,33 @@ class  MainWindow(QMainWindow):
 
         Return  params_all, slice_ctxs, report for on_fitting_joint and debug
         """
+        """
+        New version: do ALL linking in ParamRef-space.
+        lmfit names are produced ONLY by ParamRef_to_key(ParamRef).
+        Naming rule: s{sid}_p{pid}_{name}
+        Globals use pid=-1: s{sid}_p-1_mult, etc.
+        """
         # 1) common display / context
         self.current_settings()
         axis_mode = str(self.axis_mode).lower()
         ref_MHz   = float(self.ref)
         sw_hz     = float(self.sw_hz)
-        x_disp = self.f2_ppm if (axis_mode == 'ppm') else self.f2_hz
+        x_disp = self.f2_ppm if (axis_mode == "ppm") else self.f2_hz
 
         params_all = Parameters()
-        slice_ctxs: list[tuple[int, FitContext, list[Peak], list[tuple[bool,bool,bool,bool]], str]] = []
-        report = {"errors": [], "applied_linear": [], "T_results":{}}
+        slice_ctxs: list[tuple[int, "FitContext", list["Peak"], list[tuple[bool,bool,bool,bool]]]] = []
+        report = {"errors": [], "applied_linear": [], "T_results": {}}
 
         if x_disp is None:
             report["errors"].append("Display axis is not available.")
             return params_all, slice_ctxs, report
         x_disp = x_disp.astype(float)
+
         slice_times = getattr(self, "t_f1", None)
         if slice_times is None:
             slice_times = getattr(self, "slice_times", None)
 
-        # helper: names
-        def _norm(n: str) -> str:
-            return (n or "").strip().lower()
-
-        name_map = {
-            "pos": "pos", "position": "pos", "freq": "pos", "hz": "pos", "ppm": "pos",
-            "amp": "amp", "area": "amp", "amplitude": "amp",
-            "lor": "lor", "lorentz": "lor", "lor_hz": "lor",
-            "gauss": "gauss", "gauss_disp": "gauss", "gauss_display": "gauss", "gau": "gauss", "ga_display": "gauss"
-        }
-
-        # 2a) build all per-slice params
+        # 2a) build all per-slice params (using ctx.build_params that emits ParamRef-based names)
         joint_slices = sorted(set(int(s) for s in indices))
         for sid in joint_slices:
             st = self.slice_states.get(sid)
@@ -6064,8 +6080,8 @@ class  MainWindow(QMainWindow):
                 if st.fix_flags and len(st.fix_flags) >= len(peaks):
                     fix_flags = [tuple(ff) for ff in st.fix_flags[:len(peaks)]]
                 else:
-                    _, fix_flags, _ = self.peak_model.return_model()
-                    fix_flags = [tuple(ff) for ff in (fix_flags[:len(peaks)] if fix_flags else [])]
+                    _, fix_flags2, _ = self.peak_model.return_model()
+                    fix_flags = [tuple(ff) for ff in (fix_flags2[:len(peaks)] if fix_flags2 else [])]
 
             if not peaks:
                 continue
@@ -6073,68 +6089,68 @@ class  MainWindow(QMainWindow):
             y_slice = self.data2d[sid, :].astype(float)
             ctx = FitContext(x_disp, y_slice, axis_mode, ref_MHz, sw_hz)
             ctx.mask_w = self._mask_from_excluded(x_disp)
-            pre = f"s{sid}_"
-            ctx.param_prefix = pre
 
-            # build lmfit params for this slice
-            p_s = ctx.build_params(peaks, self.multiplier, self.offset, prefix=pre)
+            # IMPORTANT: build_params must now create:
+            #   s{sid}_p-1_mult, s{sid}_p-1_offset, s{sid}_p-1_phi0_deg
+            #   s{sid}_p{i}_pos/amp/lor/gauss
+            p_s = ctx.build_params(
+                peaks=peaks,
+                sid=sid,
+                multiplier=self.multiplier,
+                offset=self.offset,
+            )
             for name, par in p_s.items():
                 params_all.add(par)
 
-            # bounds 
+            # bounds (use ParamRef directly)
+            for pid in range(len(peaks)):
+                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "pos"))],   self.peak_model, sid, pid, "pos",   axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "gauss"))], self.peak_model, sid, pid, "gauss", axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "amp"))],   self.peak_model, sid, pid, "amp",   axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "lor"))],   self.peak_model, sid, pid, "lor",   axis_mode, ref_MHz)
 
-            for i in range(len(peaks)):
-                apply_bounds_to_param(params_all[f'{pre}pos_{i}'],   self.peak_model, sid, i, "pos",   axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[f'{pre}gauss_{i}'], self.peak_model, sid, i, "gauss", axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[f'{pre}amp_{i}'],   self.peak_model, sid, i, "amp",   axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[f'{pre}lor_{i}'],   self.peak_model, sid, i, "lor",   axis_mode, ref_MHz)
+            # fallback bounds if model does not provide
+            for pid in range(len(peaks)):
+                for nm, default_max in (("lor", 10000.0), ("gauss", 10000.0)):
+                    pref = ParamRef(slice_id=sid, peak_id=pid, name=nm)
+                    b = self.peak_model.get_bounds_for(pref) if self.peak_model else None
+                    if not (b and b.is_set()):
+                        k = ParamRef_to_key(pref)
+                        params_all[k].min = 0.0
+                        params_all[k].max = float(default_max)
 
-            for i in range(len(peaks)):
-                b_lor = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="lor")) if self.peak_model else None
-                if not (b_lor and b_lor.is_set()):
-                    params_all[f'{pre}lor_{i}'].min = 0.0
-                    params_all[f'{pre}lor_{i}'].max = 10000.0
+                prefA = ParamRef(slice_id=sid, peak_id=pid, name="amp")
+                bA = self.peak_model.get_bounds_for(prefA) if self.peak_model else None
+                if not (bA and bA.is_set()):
+                    params_all[ParamRef_to_key(prefA)].min = 0.0
 
-                b_g = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="gauss")) if self.peak_model else None
-                if not (b_g and b_g.is_set()):
-                    params_all[f'{pre}gauss_{i}'].min = 0.0
-                    params_all[f'{pre}gauss_{i}'].max = 10000
+            # global fixed flags (globals are pid=-1 now)
+            params_all[ParamRef_to_key(global_ref(sid, "mult"))].set(vary=not self.fix_mult,   value=self.multiplier)
+            params_all[ParamRef_to_key(global_ref(sid, "phi0_deg"))].set(vary=not self.fix_phi0, value=self.phi0_deg)
+            params_all[ParamRef_to_key(global_ref(sid, "offset"))].set(vary=not self.fix_offset, value=self.offset)
 
-                b_a = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="amp")) if self.peak_model else None
-                if not (b_a and b_a.is_set()):
-                    params_all[f'{pre}amp_{i}'].min = 0.0
+            # per-peak fixed flags
+            for pid in range(len(peaks)):
+                fpos, famp, flor, fgauss = fix_flags[pid]
+                params_all[ParamRef_to_key(ParamRef(sid, pid, "pos"))].vary   = not fpos
+                params_all[ParamRef_to_key(ParamRef(sid, pid, "amp"))].vary   = not famp
+                params_all[ParamRef_to_key(ParamRef(sid, pid, "lor"))].vary   = not flor
+                params_all[ParamRef_to_key(ParamRef(sid, pid, "gauss"))].vary = not fgauss
 
-            # global fixed flags
-
-            params_all[f'{pre}mult'].set(vary=not self.fix_mult,    value=self.multiplier)
-            params_all[f'{pre}phi0_deg'].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params_all[f'{pre}offset'].set(vary=not self.fix_offset, value=self.offset)
-
-            # per-peak fixed flag from slice fix-flags
-            for i in range(len(peaks)):
-                fpos, famp, flor, fgauss = fix_flags[i]
-                params_all[f'{pre}pos_{i}'].vary   = not fpos
-                params_all[f'{pre}amp_{i}'].vary   = not famp
-                params_all[f'{pre}lor_{i}'].vary   = not flor
-                params_all[f'{pre}gauss_{i}'].vary = not fgauss
-
-            # keep ctx for later sim
-            slice_ctxs.append((sid, ctx,
-                               [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks],
-                               fix_flags, pre))
+            slice_ctxs.append((sid, ctx, [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks], fix_flags))
 
         if not slice_ctxs:
-            report["errors"].append("messege: No slices with peaks to fit")
+            report["errors"].append("No slices with peaks to fit.")
             return params_all, slice_ctxs, report
 
-        # 2b) walk each slice's links and collect target
-        pending_linear: list[tuple[str, str, float, float, ParamRef, ParamRef]] = []
-        # schema pending_linear (tgt_key, drv_key, a, b, tgt_ref, drv_ref)
-        pending_exp: list[tuple[str, str, str, float, str, float]] = []
-        # schema pending_exp: (tgt_key, drv_key, A_val, t_sec, k_term, C_val)
+        # 2b) collect links (store ParamRef, not strings)
+        pending_linear: list[tuple["ParamRef", "ParamRef", float, float]] = []
+        # (tgt_ref, drv_ref, a, b)
+        pending_exp: list[tuple["ParamRef", "ParamRef", float, float, str, float]] = []
+        # (tgt_ref, drv_ref, A_val, t_sec, k_term, C_val)
 
-        t_by_kname: dict[str, list[float]] = {}     # k__T_name → list of t_sec used
-        Tname_for_k: dict[str, str] = {}            # k__T_name → T_name
+        t_by_kname: dict[str, list[float]] = {} # k__T_name → list of t_sec used
+        Tname_for_k: dict[str, str] = {} # k__T_name → T_name
 
         for sid in joint_slices:
             try:
@@ -6148,88 +6164,76 @@ class  MainWindow(QMainWindow):
                 )
                 links_subset = _links_for_target_slice(self.link_store, sid)
 
-                for pref_tgt, entry in reg.items():
-                    # only links whose target is in this slice
+                for pref_tgt, _entry in reg.items():
                     if int(pref_tgt.slice_id) != sid:
                         continue
                     if not self.link_store.is_linked(pref_tgt):
                         continue
 
-                    base = name_map.get(_norm(pref_tgt.name))
-                    if not base:
+                    tgt_name = canon_name(pref_tgt.name)
+                    if tgt_name not in ("pos", "amp", "lor", "gauss"):
                         continue
 
-                    # joint param key for this target
-                    tgt_key = f"s{sid}_{base}_{int(pref_tgt.peak_id)}"
+                    tgt_ref = ParamRef(slice_id=int(pref_tgt.slice_id),
+                                       peak_id=int(pref_tgt.peak_id),
+                                       name=tgt_name)
+
                     expr = links_subset.get(pref_tgt)
-                    if not expr:
+                    if not expr or expr.driver is None:
                         continue
 
-            # 2c) walk each slice's links and collect driver
-                    if expr.driver is None:
-                        continue
-
-                    if expr.driver is not None:
-                        drv = expr.driver
-                        base_d = name_map.get(_norm(drv.name))
-                    if not base_d:
+                    drv = expr.driver
+                    drv_name = canon_name(drv.name)
+                    if drv_name not in ("pos", "amp", "lor", "gauss"):
                         report["errors"].append(
-                            f"Link on {tgt_key} refers to driver with unsupported name '{drv.name}'."
+                            f"Link target {ParamRef_to_key(tgt_ref)} has unsupported driver name '{drv.name}'."
                         )
                         return params_all, slice_ctxs, report
-                    drv_key = f"s{int(drv.slice_id)}_{base_d}_{int(drv.peak_id)}"
 
-                    # we do NOT require drv_key to exist yet – we'll check in phase 3
+                    drv_ref = ParamRef(slice_id=int(drv.slice_id),
+                                       peak_id=int(drv.peak_id),
+                                       name=drv_name)
 
-            # 2d) collect LINEAR arguments
                     if expr.type == LinkType.LINEAR:
-                        a = float(expr.args.get('a', 1.0))
-                        b = float(expr.args.get('b', 0.0))
-                        pending_linear.append((tgt_key, drv_key, a, b, pref_tgt, drv))
+                        a = float(expr.args.get("a", 1.0))
+                        b = float(expr.args.get("b", 0.0))
+                        pending_linear.append((tgt_ref, drv_ref, a, b))
                         continue
 
-            # 2e) collect RELAX_EXP arguments
-                    if expr.type == LinkType.RELAX_EXP and drv is not None:
-                        # 1) A term (multiplier)
+                    if expr.type == LinkType.RELAX_EXP:
                         A_val = float(expr.args.get("A", 1.0))
 
-                        # 2) time term
+                        # time term
                         if "t_override" in expr.args:
                             t_sec = float(expr.args["t_override"])
                         else:
                             if slice_times is None:
                                 report["errors"].append(
-                                    f"Exponential link on {tgt_key} requires time data. "
-                                    "Load time_echo.txt or set t in the link."
+                                    f"Exponential link on {ParamRef_to_key(tgt_ref)} requires time data "
+                                    "(load time_echo.txt or set t_override)."
                                 )
                                 return params_all, slice_ctxs, report
                             try:
                                 t_sec = float(slice_times[sid])
                             except Exception:
                                 report["errors"].append(
-                                    f"Exponential link on {tgt_key} cannot find time for slice {sid}."
+                                    f"Exponential link on {ParamRef_to_key(tgt_ref)} cannot find time for slice {sid}."
                                 )
                                 return params_all, slice_ctxs, report
 
-                        # 3) k term (named or numeric)
-                        
+                        # k term (shared fitted k__T_name, or numeric literal)
                         if "T_name" in expr.args:
                             T_name = str(expr.args["T_name"]).strip()
                             if not T_name:
-                                report["errors"].append(
-                                    f"Exponential link on {tgt_key} has empty T_name."
-                                )
+                                report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has empty T_name.")
                                 return params_all, slice_ctxs, report
-                            
-                            # create shared k (only k is optimized, GUI keeps displaying T)
-                            k_term = None
+
                             k_name = f"k__{T_name}"
-                            
-                            Tname_for_k[k_name] = str(T_name)
+                            Tname_for_k[k_name] = T_name
                             t_by_kname.setdefault(k_name, []).append(float(t_sec))
 
                             if k_name not in params_all:
-                                params_all.add(k_name, value=1000.0, min=1e-9) # k = 1/T, default value = 1000 s-1
+                                params_all.add(k_name, value=1000.0, min=1e-9)
                                 params_all[k_name].set(vary=True)
 
                             seed_for_T = _get_seed(self, T_name)
@@ -6237,107 +6241,76 @@ class  MainWindow(QMainWindow):
                                 k_lo, k_hi = _T_bounds_to_k_bounds(seed_for_T.get("T_lo_s"), seed_for_T.get("T_hi_s"))
                                 apply_Tbounds_to_param(params_all[k_name], k_lo, k_hi)
 
-                            report["T_results"].setdefault(T_name, []).append(tgt_key)
+                            report["T_results"].setdefault(T_name, []).append(ParamRef_to_key(tgt_ref))
                             k_term = k_name
 
                         elif "T_value" in expr.args:
                             T_val = float(expr.args["T_value"])
                             if T_val <= 0:
-                                report["errors"].append(
-                                    f"Exponential link on {tgt_key} has non-positive T_value."
-                                )
+                                report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has non-positive T_value.")
+                                return params_all, slice_ctxs, report
+                            k_term = f"{(1.0 / T_val):.12g}"
+
+                        elif "T" in expr.args:
+                            T_val = float(expr.args["T"])
+                            if T_val <= 0:
+                                report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has non-positive T.")
                                 return params_all, slice_ctxs, report
                             k_term = f"{(1.0 / T_val):.12g}"
 
                         else:
-                            if "T" in expr.args:
-                                T_val = float(expr.args["T"])
-                                if T_val <= 0:
-                                    report["errors"].append(
-                                        f"Exponential link on {tgt_key} has non-positive T."
-                                    )
-                                    return params_all, slice_ctxs, report
-                                k_term = f"{(1.0 / T_val):.12g}"
-                            else:
-                                report["errors"].append(
-                                    f"Exponential link on {tgt_key} has no T_name nor T_value."
-                                )
-                                return params_all, slice_ctxs, report
+                            report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has no T_name nor T_value.")
+                            return params_all, slice_ctxs, report
 
-                        # 4) C
                         C_val = float(expr.args.get("C", 0.0))
-
-                        # defer actual expr build to phase 3
-                        pending_exp.append((tgt_key, drv_key, A_val, t_sec, k_term, C_val))
+                        pending_exp.append((tgt_ref, drv_ref, A_val, float(t_sec), str(k_term), float(C_val)))
                         continue
-
-                    # other link types: ignore for now
 
             except Exception as e:
                 report["errors"].append(f"Link error (slice {sid}): {e}")
                 return params_all, slice_ctxs, report
-            
-        
-                # === NEW (seeds): finalize per-T_name bounds and seed k initial values ===
-        # Data-aware bounds: k_min_data = eps / t_max_nonzero, k_max_data = 14 / t_min_nonzero
-        eps = 0.001 
+
+        # --- finalize per-T_name bounds and seed k initial values  ---
+        eps = 0.001
         for k_name, t_list in t_by_kname.items():
-            # sanitize times; allow t < 0 but use |t| for bounds
             t_pos = [abs(float(t)) for t in t_list if t is not None]
             if not t_pos:
-                # no usable times → keep whatever bounds came from T_seed or defaults
                 continue
-            
+
             t_min = min(t_pos)
             t_max = max(t_pos)
 
-            # data-driven bounds
             k_min_data = eps / t_max
             k_max_data = 14.0 / t_min
 
-            try:
-                par = params_all[k_name]
-            except KeyError:
+            if k_name not in params_all:
                 continue
-            
-            # --- merge existing T-seed bounds with data-driven bounds ---
+            par = params_all[k_name]
+
             old_min = par.min
             old_max = par.max
 
-            # start from data-driven range
             new_min = max(0.0, float(k_min_data))
             new_max = float(k_max_data)
 
-            # intersect with any existing bounds from T_seed (if present)
             if old_min is not None:
-                try:
-                    new_min = max(new_min, float(old_min))
-                except Exception:
-                    pass
-                
+                try: new_min = max(new_min, float(old_min))
+                except Exception: pass
             if old_max is not None:
-                try:
-                    new_max = min(new_max, float(old_max))
-                except Exception:
-                    pass
-                
-            # avoid inverted or zero-width interval
+                try: new_max = min(new_max, float(old_max))
+                except Exception: pass
+
             if not np.isfinite(new_min) or not np.isfinite(new_max):
-                # fallback: keep previous bounds if they were finite
-                if np.isfinite(old_min):
-                    new_min = float(old_min)
-                if np.isfinite(old_max):
-                    new_max = float(old_max)
+                if np.isfinite(old_min): new_min = float(old_min)
+                if np.isfinite(old_max): new_max = float(old_max)
 
             if new_max <= new_min:
-                # fall back to a narrow but valid interval around new_min
                 span = max(abs(new_min), 1.0) * 1e-3
                 new_max = new_min + span
 
             par.min = new_min
             par.max = new_max
 
-            # --- seed value from registry if available and enabled ---
             T_name = Tname_for_k.get(k_name, "")
             seed = _get_seed(self, T_name) if T_name else None
             if isinstance(seed, dict):
@@ -6345,60 +6318,58 @@ class  MainWindow(QMainWindow):
                 T_seed_s = seed.get("T_seed_s", None)
                 if T_seed_s and T_seed_s > 0:
                     k_seed = 1.0 / float(T_seed_s)
-                    # clip into *final* bounds
-                    if par.min is not None:
-                        k_seed = max(k_seed, float(par.min))
-                    if par.max is not None:
-                        k_seed = min(k_seed, float(par.max))
+                    if par.min is not None: k_seed = max(k_seed, float(par.min))
+                    if par.max is not None: k_seed = min(k_seed, float(par.max))
                     par.set(value=k_seed)
-                # respect Fix
                 par.set(vary=not fixed)
-                # stash a small note
                 report.setdefault("T_seed_applied", {})[T_name] = {
                     "fixed": fixed,
                     "T_seed": float(T_seed_s) if T_seed_s else None,
                     "k_bounds": (par.min, par.max),
                 }
 
-
-        # 3) Apply LINEAR and EXP links now that all params exist
+        # 3) Apply links (only here convert ParamRef -> lmfit name)
         try:
             missing = []
 
             # 3a) linear
-            for key, drv_key, a, b, tgt_ref, drv_ref in pending_linear:
-                if key not in params_all:
-                    missing.append(
-                        f"target {key} (slice {tgt_ref.slice_id}, peak {tgt_ref.peak_id}, {tgt_ref.name})"
-                    )
+            for tgt_ref, drv_ref, a, b in pending_linear:
+                tgt_key = ParamRef_to_key(tgt_ref)
+                drv_key = ParamRef_to_key(drv_ref)
+
+                if tgt_key not in params_all:
+                    missing.append(f"target {tgt_key}")
                     continue
                 if drv_key not in params_all:
-                    missing.append(
-                        f"driver {drv_key} (slice {drv_ref.slice_id}, peak {drv_ref.peak_id}, {drv_ref.name})"
-                    )
+                    missing.append(f"driver {drv_key}")
                     continue
-                p = params_all[key]
-                p.set(expr=f"{a}*{drv_key}+{b}")
-                report["applied_linear"].append((key, drv_key))
+
+                par = params_all[tgt_key]
+                par.set(expr=f"{a}*{drv_key}+{b}")
+                report["applied_linear"].append((tgt_key, drv_key))
                 try:
-                    p.min = -np.inf
-                    p.max =  np.inf
+                    par.min = -np.inf
+                    par.max =  np.inf
                 except Exception:
                     pass
 
             # 3b) exponential
-            for tgt_key, drv_key, A_val, t_sec, k_term, C_val in pending_exp:
+            for tgt_ref, drv_ref, A_val, t_sec, k_term, C_val in pending_exp:
+                tgt_key = ParamRef_to_key(tgt_ref)
+                drv_key = ParamRef_to_key(drv_ref)
+
                 if tgt_key not in params_all:
                     missing.append(f"target {tgt_key} (exponential)")
                     continue
                 if drv_key not in params_all:
                     missing.append(f"driver {drv_key} (exponential)")
                     continue
-                p = params_all[tgt_key]
-                p.set(expr=f"{drv_key}*({A_val})*exp(-({t_sec})*{k_term})+{C_val:.6g}")
+
+                par = params_all[tgt_key]
+                par.set(expr=f"{drv_key}*({A_val})*exp(-({t_sec})*{k_term})+{C_val:.6g}")
                 try:
-                    p.min = -np.inf
-                    p.max =  np.inf
+                    par.min = -np.inf
+                    par.max =  np.inf
                 except Exception:
                     pass
 
@@ -6406,15 +6377,16 @@ class  MainWindow(QMainWindow):
                 report["errors"].append("Cannot apply links; missing: " + "; ".join(missing))
                 return params_all, slice_ctxs, report
 
-            # final sanity (linear only)
+            # sanity: linked targets should be derived (expr set) and not vary
             bad = []
-            for key, drv_key, a, b, _t, _d in pending_linear:
-                if key in params_all:
-                    tpar = params_all[key]
+            for tgt_ref, _drv_ref, _a, _b in pending_linear:
+                tgt_key = ParamRef_to_key(tgt_ref)
+                if tgt_key in params_all:
+                    tpar = params_all[tgt_key]
                     if not getattr(tpar, "expr", ""):
-                        bad.append(f"{key} (no expr)")
+                        bad.append(f"{tgt_key} (no expr)")
                     elif getattr(tpar, "vary", True):
-                        bad.append(f"{key} (vary=True)")
+                        bad.append(f"{tgt_key} (vary=True)")
             if bad:
                 report["errors"].append("Some linked targets are not derived parameters: " + "; ".join(bad))
                 return params_all, slice_ctxs, report
@@ -6424,6 +6396,7 @@ class  MainWindow(QMainWindow):
             return params_all, slice_ctxs, report
 
         return params_all, slice_ctxs, report
+
     
     def on_show_statistics(self):
         stats = getattr(self, "fit_stats", None)

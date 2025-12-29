@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.log
 *.tmp
+*.md
 .env
 .vscode/
 .idea/
