@@ -2755,7 +2755,7 @@ def _seed_external_drivers_into_registry(
         raise RuntimeError("Cross-slice driver seeding failed:\n" + "\n".join(lines))
     
 
-# -------------------------- Physics / math core ----------------------------
+# -------------------------- Unit conversion. A fit uses Hz unit for pos, lor, gauss, and bound internally. ----------------------------
 def ppm_to_hz(x_ppm, ref: float):
     if ref is None or ref <= 0:
         raise ValueError("Invalid reference frequency. Must be > 0.")
@@ -2962,7 +2962,7 @@ def build_fid_from_peaks(
 
 
 
-# ---------- SMALL FFT UTILITY ----------
+# ---------- FFT UTILITY ----------
 def fid_to_spectrum(fid: np.ndarray) -> np.ndarray:
     spec = fft(fid)
     spec = fftshift(spec)
@@ -3020,7 +3020,7 @@ def model_spectrum(
 
     P = len(peaks)
     if P == 0:
-        # Empty spectrum: keep behavior consistent with your previous code
+        # Empty spectrum: keep behavior consistent with previous code
         t = np.fft.fftfreq(N, d=sw_hz / N)  # (kept as-is for backward compatibility)
         fid = np.zeros(N, dtype=complex)
         spec = fid_to_spectrum(fid)
@@ -3061,6 +3061,20 @@ def model_spectrum(
         return_fid=return_fid,
     )
 
+def Peaks_to_ParamRefList(sid: int, peaks: List):
+    ParamRefList = []
+    peak_attr = ["pos", "amp", "lor", "gauss"]
+    for pid in range(len(peaks)):
+        for name in peak_attr:
+            pref = ParamRef(slice_id=sid, peak_id=pid, name=name)
+            ParamRefList.append(pref)
+    return ParamRefList
+
+def ParamRef_to_key(pref: ParamRef):
+    key = f"s{int(pref.slice_id)}_p{int(pref.peak_id)}_{str(pref.name)}"
+    return key
+
+
 
 
 
@@ -3075,7 +3089,7 @@ class FitContext:
         self.ref = ref
         self.sw_hz = sw_hz
 
-    def build_params(self, peaks: List[Peak], multiplier: float = 1.0, offset: float = 0.0, *, prefix: str = "") -> Parameters: 
+    def build_params(self, peaks: List[Peak], sid: int, multiplier: float = 1.0, offset: float = 0.0, *, prefix: str = "") -> Parameters: 
         #Parameters always contains pos lor and gauss in Hz
         p = Parameters()
         pre = str(prefix) if prefix else ""
@@ -3083,20 +3097,28 @@ class FitContext:
         p.add(f'{pre}offset', value=float(offset))
         p.add(f'{pre}phi0_deg', value=0.0, min=-180.0, max=180.0)
 
-        for i, pk in enumerate(peaks):
-            if self.axis_mode.lower() == 'ppm':
-                p.add(f'{pre}p{i}_pos',   value=float(ppm_to_hz(pk.pos, self.ref)))
-                p.add(f'{pre}p{i}_gauss', value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
-            else:
-                p.add(f'{pre}p{i}_pos',   value=float(pk.pos))
-                p.add(f'{pre}p{i}_gauss', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
-                
-            p.add(f'{pre}p{i}_amp',   value=max(1e-9, float(pk.amp)), min=0.0)
-            p.add(f'{pre}p{i}_lor',   value=max(1.0, float(pk.lor_hz)), min=0.0)
+        ParamRefList = Peaks_to_ParamRefList(sid, peaks)
+        for pref in ParamRefList:
+            name = ParamRef_to_key(pref)
+            pk = peaks[pref.peak_id]       
+            if pref.name == "pos":
+                if self.axis_mode.lower() == 'ppm':
+                    p.add(f'{name}',   value=float(ppm_to_hz(pk.pos, self.ref)))
+                else:
+                    p.add(f'{name}',   value=float(pk.pos))
+            elif pref.name == "gauss":            
+                if self.axis_mode.lower() == 'ppm':
+                    p.add(f'{name}',   value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
+                else:
+                    p.add(f'{name}', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
+            elif pref.name == "lor":
+                p.add(f'{name}',   value=max(1.0, float(pk.lor_hz)), min=0.0)
+            elif pref.name == "amp":
+                p.add(f'{name}',   value=max(1e-9, float(pk.amp)), min=0.0)
 
         return p
 
-    def update_peaks_from_params(self, peaks: List[Peak], params: Parameters, *, prefix: str = ""):
+    def result_to_peaks(self, peaks: List[Peak], params: Parameters, *, prefix: str = ""):
         pre = str(prefix) if prefix else ""
         for i in range(len(peaks)):
             peaks[i].pos        = hz_to_ppm(params[f'{pre}pos_{i}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{pre}pos_{i}'].value
@@ -3898,10 +3920,10 @@ def add_peak_to_PeakTableModel(self,
         fix_flags = (d["pos"], d["amp"], d["lor"], d["gauss"])
 
     # Push to model
-    self.peak_model.add_peak(pk=pk, fix_flags=fix_flags, default_fix=self._default_fix)
+    self.peak_model.add_row(pk=pk, fix_flags=fix_flags, default_fix=self._default_fix)
 
     # Keep domain cache in sync for callers that read self.peaks/self.fix_flags()
-    self.sync_from_Model()
+    self.Model_to_Peaks()
 
     # Mark current slice state dirty (don’t rely on any missing _invalidate_slice_cache)
     st = self.slice_states.get(int(getattr(self, "slice_index", 0)))
@@ -3943,8 +3965,9 @@ class  MainWindow(QMainWindow):
         # --- initialize single-slice SSOT before GUI build ---
 
         self.slice_index = 0 # int
-        self.slice_states = {} # : dict[int, SliceFitState]
+        self.slice_states = {} # : dict[int, SliceFitState()]
         self.slice_states[0] = SliceFitState()
+        
         self.link_store = LinkStore()
         # ---- T-seed registry (authoritative) ----
         # schema: {T_name: {"fixed": bool, "T_seed_s": float|None, "T_result_s": float|None}
@@ -4177,8 +4200,8 @@ class  MainWindow(QMainWindow):
         right.addLayout(form)
     
         # Peak table (view + model)
-        self.tbl = QtWidgets.QTableView()
         self.peak_model = PeakTableModel(self.peaks)
+        self.tbl = QtWidgets.QTableView()
         self.tbl.setModel(self.peak_model)
         delegate = ScientificDoubleDelegate(self.tbl, decimals=12)
         for c in (0, 2, 4, 6):
@@ -4240,7 +4263,6 @@ class  MainWindow(QMainWindow):
         layout.addLayout(left, 3)
         layout.addLayout(right, 2)   
        
-    # A7: providers used by context menu
     def _slice_count(self) -> int:
         data2d = getattr(self, "data2d", None)
         if getattr(data2d, "ndim", 0) == 2:
@@ -4861,7 +4883,7 @@ class  MainWindow(QMainWindow):
             hdr.update()
         self.tbl.resizeColumnsToContents()
 
-    def sync_from_Model(self) -> None:
+    def Model_to_Peaks(self) -> None:
         """Sync peaks from the PeakTableModel (SSOT)."""
         peaks, fix_flags, _ = self.peak_model.return_model()
         self.peaks = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks]
@@ -5249,7 +5271,7 @@ class  MainWindow(QMainWindow):
             return
         self._force_commit_table_edits()
         self.current_settings()
-        self.sync_from_Model()
+        self.Model_to_Peaks()
         self._save_slice_state(self.slice_index, has_fit=False)
         self.display_slice(int(val), preserve_view=True)
         self.update_ui_state()
@@ -5358,7 +5380,7 @@ class  MainWindow(QMainWindow):
         self.peak_model.remove_rows(rows)
 
         # 2) sync domain cache and mark slice dirty
-        self.sync_from_Model()
+        self.Model_to_Peaks()
         st = self.slice_states.get(int(getattr(self, "slice_index", 0)))
         if st:
             st.peaks = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in self.peaks]
@@ -5465,7 +5487,7 @@ class  MainWindow(QMainWindow):
             self.status.showMessage('Right click to choose width (distance from the chosen position)', 2000)
     
     def on_toggle_add(self, checked: bool):
-        # When entering Add Peaks mode, force toolbar to neutral so clicks reach us
+        # When entering Add Peaks mode, force toolbar to neutral so clicks reach user
         if checked:
             if hasattr(self, 'nav') and hasattr(self.nav, 'mode'):
                 self.nav.mode = ''
@@ -5494,7 +5516,7 @@ class  MainWindow(QMainWindow):
             self._pending_height = None
             self.status.clearMessage()
 
-    def on_autopick(self):
+    def on_autopick(self): #does not work. fix later
         if self.x is None or self.y is None:
             return
         N, ok = QInputDialog.getInt(self, 'Auto-Pick', 'How many peaks?', 3, 1, 50, 1)
@@ -5655,7 +5677,7 @@ class  MainWindow(QMainWindow):
                     log.warning("FINAL logging failed: %s", _e)
 
             # 8) Update peaks & globals from result
-            ctx.update_peaks_from_params(peaks, result.params)
+            ctx.result_to_peaks(peaks, result.params)
             self.multiplier = result.params['mult'].value
             self.offset     = result.params['offset'].value
             self.phi0_deg   = result.params['phi0_deg'].value
@@ -5852,7 +5874,7 @@ class  MainWindow(QMainWindow):
 
         # Scatter back per slice; refresh caches/UI
         for sid, ctx, tmpl, fix_flags, pre in slice_ctxs:
-            ctx.update_peaks_from_params(tmpl, result.params, prefix=pre)
+            ctx.result_to_peaks(tmpl, result.params, prefix=pre)
             mult_val  = result.params[f'{pre}mult'].value
             off_val   = result.params[f'{pre}offset'].value
             phi0_val  = result.params[f'{pre}phi0_deg'].value
@@ -6446,7 +6468,7 @@ class  MainWindow(QMainWindow):
             self.current_settings()
 
             # 2) sync peakTableModel → self.peaks (read pos/amp/lor/gauss and fix flags)
-            self.sync_from_Model()
+            self.Model_to_Peaks()
 
             if not self.peaks:
                 QMessageBox.information(self, 'Simulate', 'No peaks to simulate. Add peaks or Auto-Pick first.')
@@ -6564,8 +6586,8 @@ class  MainWindow(QMainWindow):
         if not path:
             return
         # --- Ensure UI state synced ---
-        if hasattr(self, "sync_from_Model"):
-            self.sync_from_Model()
+        if hasattr(self, "Model_to_Peaks"):
+            self.Model_to_Peaks()
         if hasattr(self, "current_settings"):
             try:
                 self.current_settings()
@@ -6632,11 +6654,6 @@ class  MainWindow(QMainWindow):
         QtWidgets.QMessageBox.information(self, "Export ASCII", f"Saved: {path}")
 
     def on_export_peak_table(self):
-        def _get_current_model_state():
-            """Read peaks + fix flags from the model."""
-            p, ff, rc = self.peak_model.return_model()
-            return p, ff, rc
-
         def get_slice_for_export(idx: int):
             """Return a state-like object with attributes used by the exporter."""
             st = getattr(self, "slice_states", {}).get(idx, None)
@@ -6658,7 +6675,7 @@ class  MainWindow(QMainWindow):
                 except Exception:
                     self.phi0_deg = float(getattr(self, "phi0_deg", 0.0))
                 # Read from model (single source of truth)
-                peaks_now, fix_now, redchi = _get_current_model_state()
+                peaks_now, fix_now, redchi = self.peak_model.return_model()
                 class _Now: ...
                 now = _Now()
                 now.peaks = list(peaks_now)
@@ -6678,7 +6695,7 @@ class  MainWindow(QMainWindow):
             # if state carries fix flags, use them; else read from current model
             state_fix = getattr(state, "fix_flags", None)
             if state_fix is None:
-                _, state_fix, _ = _get_current_model_state()
+                _, state_fix, _ = self.peak_model.return_model()
             for i, pk in enumerate(getattr(state, "peaks", []) or []):
                 if i < len(state_fix):
                     fix_pos, fix_amp, fix_lor, fix_gauss = state_fix[i]
