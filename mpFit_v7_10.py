@@ -3074,8 +3074,8 @@ def ParamRef_to_key(pref: ParamRef):
     return key
 
 def global_ref(sid: int, name: str) -> "ParamRef":
-    # globals still follow the same rule by using peak_id = -1
-    return ParamRef(slice_id=int(sid), peak_id=-1, name=str(name))
+    # globals still follow the same rule by using peak_id = 000
+    return ParamRef(slice_id=int(sid), peak_id=000, name=str(name))
 
 def canon_name(n: str) -> str:
     """Keep this small. Best is: LinkManager only ever stores canonical names."""
@@ -3102,7 +3102,7 @@ class FitContext:
     def build_params(self, peaks: List[Peak], sid: int, multiplier: float = 1.0, offset: float = 0.0, *, prefix: str = "") -> Parameters: 
         #Parameters always contains pos lor and gauss in Hz
         p = Parameters()
-        pre = str(prefix) if prefix else ""
+
         p.add(f'{ParamRef_to_key(global_ref(sid, "mult"))}', value=float(multiplier), min=0.0)
         p.add(f'{ParamRef_to_key(global_ref(sid, "offset"))}', value=float(offset))
         p.add(f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}', value=0.0, min=-180.0, max=180.0)
@@ -3130,17 +3130,17 @@ class FitContext:
 
         return p
 
-    def result_to_peaks(self, peaks: List[Peak], params: Parameters, *, prefix: str = ""):
-        pre = str(prefix) if prefix else ""
+    def result_to_peaks(self, peaks: List[Peak], params: Parameters, sid: int) -> None:
+
         for i in range(len(peaks)):
-            peaks[i].pos        = hz_to_ppm(params[f'{pre}pos_{i}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{pre}pos_{i}'].value
-            peaks[i].amp        = params[f'{pre}amp_{i}'].value
-            peaks[i].lor_hz     = params[f'{pre}lor_{i}'].value
-            peaks[i].gauss_disp = hz_to_ppm(params[f'{pre}gauss_{i}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{pre}gauss_{i}'].value
+            peaks[i].pos        = hz_to_ppm(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value
+            peaks[i].amp        = params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value
+            peaks[i].lor_hz     = params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value
+            peaks[i].gauss_disp = hz_to_ppm(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value
 
 
 
-    def residual(self, params: Parameters, peaks_shape: List[Peak]) -> np.ndarray:
+    def residual(self, params: Parameters, peaks_shape: List[Peak], sid) -> np.ndarray:
         """
         peaks_shape is to get the number of peaks to build an updated peaks List during optimization
         no actual value of peak_shape is read.
@@ -3154,16 +3154,16 @@ class FitContext:
         if len(self.x) != len(self.y):
             raise ValueError("x and y must have the same length for residual computation.")
 
-        pre = getattr(self, "param_prefix", "") or ""
+
 
         # --- rebuild peaks from params (in Hz) ---
         peaks: List[Peak] = []
         for i in range(len(peaks_shape)):
             peaks.append(Peak(
-                pos=params[f'{pre}pos_{i}'].value, #Hz
-                amp=params[f'{pre}amp_{i}'].value,
-                lor_hz=params[f'{pre}lor_{i}'].value, #Hz
-                gauss_disp=params[f'{pre}gauss_{i}'].value, #Hz
+                pos=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, #Hz
+                amp=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value,
+                lor_hz=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value, #Hz
+                gauss_disp=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, #Hz
             ))
 
         x_disp = np.asarray(self.x, dtype=float)
@@ -3177,13 +3177,13 @@ class FitContext:
             sw_hz=self.sw_hz,
             N=len(self.x),
             x=x_hz,                         # pass current display axis; orchestrator canonicalizes
-            multiplier=params[f'{pre}mult'].value,
+            multiplier=params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].value,
             return_fid=False,
         )
 
         # --- apply ONLY zero-order phase and offset ---
-        phi0   = params.get(f'{pre}phi0_deg', 0.0).value
-        offset = params.get(f'{pre}offset',   0.0).value
+        phi0   = params.get(f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}', 0.0).value
+        offset = params.get(f'{ParamRef_to_key(global_ref(sid, "offset"))}',   0.0).value
         model = apply_phase_and_offset(spec_c, phi0, offset)
 
         # --- residual on display grid ---
@@ -3218,10 +3218,8 @@ class FitContext:
             if should_log:
                 log.info(
                     "RESIDUAL call #%d | pre='%s' | MHz=%.6f | sw_display=%.3f Hz | sw_hz(ctx)=%s | mult=%.3f | phi0=%.6g deg | %s | %s",
-                    c, pre, float(self.ref), sw_grid_hz,
-                    "None" if (self.sw_hz is None) else f"{float(self.sw_hz):.6g}",
-                    params[f'{pre}mult'].value,
-                    float(phi0),
+                    c, float(self.ref), sw_grid_hz,
+
                     _arr_summary("x_disp", x_disp),
                     _arr_summary("x_hz",   x_hz),
                 )
@@ -5601,41 +5599,41 @@ class  MainWindow(QMainWindow):
             # 3) Build context and LMFit params
             ctx = FitContext(self.x, self.y, self.axis_mode, self.ref, self.sw_hz)
             ctx.mask_w = mask_w
-            params = ctx.build_params(peaks, self.multiplier, self.offset, prefix=f's{sid}_') #params is a Paramters instance aka a dictionary
+            params = ctx.build_params(peaks, sid, self.multiplier, self.offset) #params is a Paramters instance aka a dictionary
 
             # globals vary/freeze
-            params[f's{sid}_mult'].set(vary=not self.fix_mult,    value=self.multiplier)
-            params[f's{sid}_phi0_deg'].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params[f's{sid}_offset'].set(vary=not self.fix_offset, value=self.offset)        
+            params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].set(vary=not self.fix_mult,    value=self.multiplier)
+            params[f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}'].set(vary=not self.fix_phi0, value=self.phi0_deg)
+            params[f'{ParamRef_to_key(global_ref(sid, "offset"))}'].set(vary=not self.fix_offset, value=self.offset)        
 
             for i in range(len(peaks)):
-                apply_bounds_to_param(params[f'pos_{i}'],   self.peak_model, sid, i, "pos",   self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'gauss_{i}'], self.peak_model, sid, i, "gauss", self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'amp_{i}'],   self.peak_model, sid, i, "amp",   self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'lor_{i}'],   self.peak_model, sid, i, "lor",   self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'],   self.peak_model, sid, i, "pos",   self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'], self.peak_model, sid, i, "gauss", self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'],   self.peak_model, sid, i, "amp",   self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'],   self.peak_model, sid, i, "lor",   self.axis_mode, self.ref)
 
             for i in range(len(peaks)):
                 b_lor = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="lor")) if self.peak_model else None
                 if not (b_lor and b_lor.is_set()):
-                    params[f'lor_{i}'].min = 0.0
-                    params[f'lor_{i}'].max = 10000.0
+                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].min = 0.0
+                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].max = 10000.0
 
                 b_g = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="gauss")) if self.peak_model else None
                 if not (b_g and b_g.is_set()):
-                    params[f'gauss_{i}'].min = 0.0
-                    params[f'gauss_{i}'].max = 10000
+                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].min = 0.0
+                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].max = 10000
 
                 b_a = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="amp")) if self.peak_model else None
                 if not (b_a and b_a.is_set()):
-                    params[f'amp_{i}'].min = 0.0
+                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].min = 0.0
 
             # 4) Apply per-peak vary for lmfit from GUI fix flags. lmfit set vary = 1. GUI set fix = 1 to be consistent with ssnake
             for i in range(len(peaks)):
                 fpos, famp, flor, fgauss = fix_flags[i]
-                params[f'pos_{i}'].vary   = not fpos
-                params[f'amp_{i}'].vary   = not famp
-                params[f'lor_{i}'].vary   = not flor
-                params[f'gauss_{i}'].vary = not fgauss
+                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].vary   = not fpos
+                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].vary   = not famp
+                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].vary   = not flor
+                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].vary = not fgauss
 
             # 5) Resolve links for THIS slice: seed external drivers + evaluate + freeze linked targets
             s = int(getattr(self, "slice_index", 0))
@@ -5656,12 +5654,15 @@ class  MainWindow(QMainWindow):
                 return  # finally{} will end_busy()
 
             # 6) Fit
+
             try:
                 result = minimize(
-                    ctx.residual, params, args=(peaks,),
+                    lambda p: ctx.residual(p, peaks, sid),
+                    params,
                     method='least_squares', max_nfev=5000,
                     ftol=1e-8, xtol=1e-8, gtol=1e-8, x_scale='jac', loss='soft_l1'
                 )
+
                 self.fit_stats = extract_FitResult_and_corr(result)
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, 'Fit error', str(e))
@@ -5695,10 +5696,10 @@ class  MainWindow(QMainWindow):
                     log.warning("FINAL logging failed: %s", _e)
 
             # 8) Update peaks & globals from result
-            ctx.result_to_peaks(peaks, result.params)
-            self.multiplier = result.params['mult'].value
-            self.offset     = result.params['offset'].value
-            self.phi0_deg   = result.params['phi0_deg'].value
+            ctx.result_to_peaks(peaks, result.params, sid)
+            self.multiplier = result.params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].value
+            self.offset     = result.params[f'{ParamRef_to_key(global_ref(sid, "offset"))}'].value
+            self.phi0_deg   = result.params[f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}'].value
 
             # UI widgets reflect new globals (block signals while setting)
             for w in (self.edt_mult, self.edt_offset):
