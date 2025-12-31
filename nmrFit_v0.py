@@ -104,6 +104,8 @@ from constraint_rules import (
     ConstraintRule_to_LinkExpr,
     ConstrainedPeak,
     ConstraintStore,
+    ConstraintValidationError,
+    FitOrchestrator,
 )
 
 import os
@@ -3100,6 +3102,36 @@ class FitContext:
         self.axis_mode = axis_mode
         self.ref = ref
         self.sw_hz = sw_hz
+        self.orchestrator: Optional[FitOrchestrator] = None
+        self.constraint_errors: List[ConstraintValidationError] = []
+
+    def set_orchestrator(self, orchestrator: Optional[FitOrchestrator]) -> None:
+        """Set FitOrchestrator for constraint management during fit."""
+        self.orchestrator = orchestrator
+        self.constraint_errors = []
+
+    def validate_constraints(self, peak_map: Dict[Tuple[int, int], Peak], 
+                           slice_states: Dict[int, "SliceFitState"]) -> List[ConstraintValidationError]:
+        """
+        Validate all constraints before fitting. Collects errors rather than raising.
+        Returns list of ConstraintValidationError; empty list if all valid.
+        """
+        if self.orchestrator is None:
+            return []
+        self.constraint_errors = self.orchestrator.validate_constraints(peak_map, slice_states)
+        return self.constraint_errors
+
+    def apply_constraints_to_lmfit(self, params: Parameters, peak_map: Dict[Tuple[int, int], Peak],
+                                   slice_states: Dict[int, "SliceFitState"], 
+                                   name_map: Optional[Dict[str, str]] = None) -> None:
+        """
+        Apply constraints to lmfit Parameters. Should be called after build_params().
+        Works in coordination with orchestrator to handle both same-slice (algebraic)
+        and cross-slice (numeric) constraints.
+        """
+        if self.orchestrator is None:
+            return
+        self.orchestrator.apply_constraints_to_lmfit(params, peak_map, slice_states, name_map)
 
     def build_params(self, peaks: List[Peak], sid: int, multiplier: float = 1.0, offset: float = 0.0, *, prefix: str = "") -> Parameters: 
         #Parameters always contains pos lor and gauss in Hz
@@ -4268,6 +4300,9 @@ class  MainWindow(QMainWindow):
         self.peak_model.rowsInserted.connect(lambda *_: self.hdr.viewport().update())
         self.peak_model.rowsRemoved.connect(lambda *_: self.hdr.viewport().update())
 
+        # Phase 6B: Constraint Diagnostic Panel
+        self._build_constraint_diagnostic_panel(right)
+
         # Buttons for table rows
         row_ctrls = QtWidgets.QHBoxLayout()
         self.btn_add = QtWidgets.QPushButton('Add Peak')
@@ -4278,6 +4313,201 @@ class  MainWindow(QMainWindow):
         layout.addLayout(left, 3)
         layout.addLayout(right, 2)   
        
+    def _build_constraint_diagnostic_panel(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        """
+        Phase 6B: Build constraint diagnostic panel with:
+        - Real-time constraint status (# of constraints, # linked peaks)
+        - Test Constraint button
+        - Constraint list display (scrollable text)
+        - Status indicator (green/yellow/red)
+        """
+        # ---- Constraint Panel Frame ----
+        constraint_frame = QtWidgets.QGroupBox("Constraints")
+        constraint_frame.setStyleSheet("""
+            QGroupBox { font-weight: bold; margin-top: 8px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 3px; }
+        """)
+        constraint_layout = QtWidgets.QVBoxLayout(constraint_frame)
+
+        # ---- Status Bar (# constraints, status indicator) ----
+        status_h = QtWidgets.QHBoxLayout()
+        
+        # Status indicator circle (red/yellow/green)
+        self.constraint_status_indicator = QtWidgets.QLabel("●")
+        self.constraint_status_indicator.setStyleSheet("color: green; font-size: 14px;")
+        self.constraint_status_indicator.setToolTip("Green: No constraints | Yellow: Constraints present | Red: Validation failed")
+        self.constraint_status_indicator.setFixedWidth(20)
+        
+        # Status text
+        self.constraint_status_label = QtWidgets.QLabel("No constraints")
+        self.constraint_status_label.setStyleSheet("font-size: 10px; color: #666;")
+        
+        status_h.addWidget(self.constraint_status_indicator)
+        status_h.addWidget(self.constraint_status_label, 1)
+        constraint_layout.addLayout(status_h)
+
+        # ---- Constraint List Display (read-only text) ----
+        self.constraint_list_text = QtWidgets.QTextEdit()
+        self.constraint_list_text.setReadOnly(True)
+        self.constraint_list_text.setMaximumHeight(80)
+        self.constraint_list_text.setMinimumHeight(60)
+        self.constraint_list_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #f5f5f5;
+                border: 1px solid #ddd;
+                border-radius: 3px;
+                padding: 4px;
+                font-family: 'Courier New', monospace;
+                font-size: 9px;
+            }
+        """)
+        self.constraint_list_text.setPlaceholderText("Constraints will appear here...")
+        constraint_layout.addWidget(self.constraint_list_text)
+
+        # ---- Buttons (Test Constraint, Refresh, Clear) ----
+        btn_h = QtWidgets.QHBoxLayout()
+        
+        self.btn_test_constraint = QtWidgets.QPushButton("Test Constraint")
+        self.btn_test_constraint.setToolTip("Validate all constraints and show results")
+        self.btn_test_constraint.setIcon(QtGui.QIcon())  # placeholder
+        
+        self.btn_refresh_constraint = QtWidgets.QPushButton("Refresh")
+        self.btn_refresh_constraint.setToolTip("Update constraint display")
+        
+        btn_h.addWidget(self.btn_test_constraint, 1)
+        btn_h.addWidget(self.btn_refresh_constraint, 1)
+        constraint_layout.addLayout(btn_h)
+
+        # Add the panel to the parent layout
+        parent_layout.addWidget(constraint_frame)
+
+        # Phase 6B: Signal connections
+        self.btn_test_constraint.clicked.connect(self.on_test_constraint)
+        self.btn_refresh_constraint.clicked.connect(self.on_refresh_constraint_status)
+        
+        # Update constraint status when link store or peak table changes
+        if hasattr(self, 'peak_model'):
+            try:
+                self.peak_model.dataChanged.connect(self.on_refresh_constraint_status)
+                self.peak_model.modelReset.connect(self.on_refresh_constraint_status)
+            except Exception:
+                pass
+
+    def on_refresh_constraint_status(self) -> None:
+        """
+        Phase 6B: Update constraint diagnostic panel with current status.
+        - Count constraints from link_store
+        - Show linked peaks
+        - Update status indicator color
+        """
+        try:
+            if not hasattr(self, 'link_store') or not self.link_store:
+                self.constraint_status_label.setText("No constraints defined")
+                self.constraint_status_indicator.setStyleSheet("color: green; font-size: 14px;")
+                self.constraint_list_text.setPlainText("")
+                return
+
+            # Count constraints
+            all_exprs = list(self.link_store.all_expr())
+            enabled_count = sum(1 for e in all_exprs if getattr(e, 'enabled', True))
+            total_count = len(all_exprs)
+
+            # Build constraint summary
+            constraint_lines = []
+            constraint_lines.append(f"Total constraints: {total_count} (enabled: {enabled_count})")
+            constraint_lines.append("")
+
+            # Current slice info
+            sid = int(getattr(self, "slice_index", 0))
+            constraint_lines.append(f"Current slice: s{sid}")
+            constraint_lines.append("")
+
+            # List constraints for current slice
+            slice_targets = []
+            slice_drivers = []
+            for expr in all_exprs:
+                if expr.target and int(expr.target.slice_id) == sid:
+                    slice_targets.append(expr.target)
+                if expr.driver and int(expr.driver.slice_id) == sid:
+                    slice_drivers.append(expr.driver)
+
+            if slice_targets:
+                constraint_lines.append(f"Targets in s{sid}:")
+                for tgt in slice_targets:
+                    expr = self.link_store.get(tgt)
+                    status_icon = "✓" if getattr(expr, 'enabled', True) else "✗"
+                    constraint_lines.append(
+                        f"  {status_icon} s{tgt.slice_id}_p{tgt.peak_id}_{tgt.name}"
+                    )
+            
+            if slice_drivers:
+                constraint_lines.append("")
+                constraint_lines.append(f"Drivers in s{sid}:")
+                for drv in slice_drivers:
+                    constraint_lines.append(f"  → s{drv.slice_id}_p{drv.peak_id}_{drv.name}")
+
+            # Update UI
+            self.constraint_list_text.setPlainText("\n".join(constraint_lines))
+
+            # Update status indicator
+            if enabled_count == 0:
+                self.constraint_status_label.setText("No active constraints")
+                self.constraint_status_indicator.setStyleSheet("color: green; font-size: 14px;")
+            else:
+                self.constraint_status_label.setText(f"{enabled_count} constraint(s) active")
+                self.constraint_status_indicator.setStyleSheet("color: #ff9800; font-size: 14px;")  # Orange
+
+        except Exception as e:
+            log.warning("Failed to update constraint status: %s", e)
+            self.constraint_status_label.setText("Error reading constraints")
+            self.constraint_status_indicator.setStyleSheet("color: red; font-size: 14px;")
+
+    def on_test_constraint(self) -> None:
+        """
+        Phase 6B: Test all constraints by validating against current peaks.
+        Shows results in a dialog.
+        """
+        try:
+            if not hasattr(self, 'link_store') or not self.link_store:
+                QtWidgets.QMessageBox.information(self, "Test Constraint", "No constraints defined.")
+                return
+
+            # Read current peaks
+            peaks, fix_flags, _ = self.peak_model.return_model()
+            if not peaks:
+                QtWidgets.QMessageBox.warning(self, "Test Constraint", "No peaks defined.")
+                return
+
+            sid = int(getattr(self, "slice_index", 0))
+            peak_map = {(sid, i): peaks[i] for i in range(len(peaks))}
+
+            # Create orchestrator from link_store
+            try:
+                orchestrator = FitOrchestrator.from_link_store(self.link_store)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Test Constraint", f"Failed to create orchestrator:\n{e}")
+                return
+
+            # Validate constraints
+            errors = orchestrator.validate_constraints(peak_map, self.slice_states)
+
+            # Show results
+            if errors:
+                error_msg = "Constraint Validation Results:\n\n"
+                error_msg += "❌ FAILED:\n\n"
+                for error in errors:
+                    error_msg += f"• {error.target_pref}: {error.message}\n"
+                self.constraint_status_indicator.setStyleSheet("color: red; font-size: 14px;")
+                QtWidgets.QMessageBox.warning(self, "Constraint Validation", error_msg)
+            else:
+                success_msg = f"✓ All {len(list(self.link_store.all_expr()))} constraint(s) are valid!"
+                self.constraint_status_indicator.setStyleSheet("color: green; font-size: 14px;")
+                QtWidgets.QMessageBox.information(self, "Constraint Validation", success_msg)
+
+        except Exception as e:
+            log.error("Constraint test failed: %s", e)
+            QtWidgets.QMessageBox.critical(self, "Test Constraint Error", str(e))
+    
     def _slice_count(self) -> int:
         data2d = getattr(self, "data2d", None)
         if getattr(data2d, "ndim", 0) == 2:
@@ -4335,11 +4565,41 @@ class  MainWindow(QMainWindow):
 
 
     # C3: mark lmfit Parameters for linked targets in current slice
-    def _apply_links_to_lmfit(self, params, s: int) -> None:
+    def _apply_links_to_lmfit(self, params, s: int, use_orchestrator: bool = False) -> None:
         """
         Resolve links for the current slice `s` and freeze linked targets in LMFit `params`.
-        Key change: seed external (cross-slice) drivers into `reg` *before* LinkEngine.evaluate.
+        
+        If use_orchestrator=True, attempts to use FitOrchestrator pattern (Phase 6 integration).
+        Falls back to LinkEngine.evaluate if orchestrator not available or not configured.
         """
+        # Try orchestrator path first (Phase 6)
+        if use_orchestrator:
+            try:
+                if hasattr(self, '_fit_context') and self._fit_context and self._fit_context.orchestrator:
+                    # Build peak map for this slice
+                    peak_map = {}
+                    st = self.slice_states.get(int(s))
+                    if st:
+                        for pid, peak in enumerate(st.peaks):
+                            peak_map[(int(s), pid)] = peak
+                    
+                    # Apply constraints via orchestrator
+                    self._fit_context.apply_constraints_to_lmfit(
+                        params=params,
+                        peak_map=peak_map,
+                        slice_states=self.slice_states,
+                        name_map={
+                            "pos": "pos", "position": "pos", "freq": "pos",
+                            "amp": "amp", "area": "amp", "amplitude": "amp",
+                            "lor": "lor", "lorentz": "lor", "lorentz_hz": "lor",
+                            "gauss": "gauss", "gauss_disp": "gauss",
+                        }
+                    )
+                    return  # Success with orchestrator
+            except Exception as e:
+                log.warning("Orchestrator constraint application failed, falling back to LinkEngine: %s", e)
+        
+        # Fallback: Original LinkEngine-based approach
         # 1) Build per-slice registry
         reg = self._build_registry_for_slice(int(s))
         # quick exit if nothing to do
@@ -4580,6 +4840,10 @@ class  MainWindow(QMainWindow):
         dlg.exec_()
         # after user edits links, refresh current table so tooltips / gray text update
         self.peak_model.layoutChanged.emit()
+        
+        # Phase 6B: Refresh constraint diagnostic panel
+        if hasattr(self, 'on_refresh_constraint_status'):
+            self.on_refresh_constraint_status()
 
 
     def show_slice_picker(self, N: int, labels: list[str] | None = None, prechecked: list[int] | None = None) -> list[int]:
@@ -4708,16 +4972,20 @@ class  MainWindow(QMainWindow):
             # table _ plots from cache
             self._load_model_from_state(st)
             self.refresh_plot_from_state(st, preserve_view=preserve_view)
-            return
-        
-        if st is not None:
+        elif st is not None:
             self._load_model_from_state(st)
             self.refresh_plot(show_model=False, preserve_view=preserve_view)
-            return
+        else:
+            # no cache yet -> data only
+            self._on_data_state_changed()
+            self.refresh_plot(show_model=False, preserve_view=preserve_view)
         
-        # no cache yet -> data only
-        self._on_data_state_changed()
-        self.refresh_plot(show_model=False, preserve_view=preserve_view)
+        # Phase 6B: Refresh constraint status when slice changes
+        if hasattr(self, 'on_refresh_constraint_status'):
+            try:
+                self.on_refresh_constraint_status()
+            except Exception:
+                pass
    
     def _read_line_float(self, w: QtWidgets.QLineEdit, default: float | None = None) -> float | None:
         t = w.text().strip()
@@ -5293,6 +5561,10 @@ class  MainWindow(QMainWindow):
         self._save_slice_state(self.slice_index, has_fit=False)
         self.display_slice(int(val), preserve_view=True)
         self.update_ui_state()
+        
+        # Phase 6B: Refresh constraint status when slice changes
+        if hasattr(self, 'on_refresh_constraint_status'):
+            self.on_refresh_constraint_status()
 
     def _force_commit_table_edits(self) -> None:
         """
@@ -5602,6 +5874,16 @@ class  MainWindow(QMainWindow):
             # 3) Build context and LMFit params
             ctx = FitContext(self.x, self.y, self.axis_mode, self.ref, self.sw_hz)
             ctx.mask_w = mask_w
+            
+            # Phase 6: Setup FitOrchestrator if link_store has constraints to apply
+            # This enables validation before fitting
+            try:
+                if hasattr(self, 'link_store') and self.link_store:
+                    orchestrator = FitOrchestrator.from_link_store(self.link_store)
+                    ctx.set_orchestrator(orchestrator)
+            except Exception as e:
+                log.warning("Failed to create orchestrator from link_store: %s", e)
+            
             params = ctx.build_params(peaks, sid, self.multiplier, self.offset) #params is a Paramters instance aka a dictionary
 
             # globals vary/freeze
@@ -5655,6 +5937,17 @@ class  MainWindow(QMainWindow):
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Link error", str(e))
                 return  # finally{} will end_busy()
+
+            # Phase 6A: Validate constraints before fitting
+            # Build peak map for validation
+            peak_map = {(sid, i): peaks[i] for i in range(len(peaks))}
+            constraint_errors = ctx.validate_constraints(peak_map, self.slice_states)
+            if constraint_errors:
+                error_msg = "Constraint validation errors:\n\n"
+                for error in constraint_errors:
+                    error_msg += f"• {error.target_pref}: {error.message}\n"
+                QtWidgets.QMessageBox.warning(self, "Constraint Validation Failed", error_msg)
+                return  # finally{} will _end_busy()
 
             # 6) Fit
 

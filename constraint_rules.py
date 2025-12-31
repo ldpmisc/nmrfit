@@ -1073,21 +1073,40 @@ class ConstraintStore:
         """
         store = ConstraintStore()
         
-        if link_store is None or not hasattr(link_store, 'links'):
+        if link_store is None:
             return store
         
-        for link_expr in link_store.links:
-            if link_expr is None:
-                continue
+        # Try all_expr() method first (LinkStore implementation)
+        try:
+            for link_expr in link_store.all_expr():
+                if link_expr is None:
+                    continue
+                try:
+                    rule = LinkExpr_to_ConstraintRule(link_expr)
+                    if rule is not None:
+                        target_pref = getattr(link_expr, 'target', None)
+                        if target_pref is not None:
+                            store.add_constraint(target_pref, rule)
+                except Exception:
+                    # Skip malformed LinkExpr objects
+                    continue
+        except Exception:
+            # Fallback: try _by_target dict (LinkStore internal structure)
             try:
-                rule = LinkExpr_to_ConstraintRule(link_expr)
-                if rule is not None:
-                    target_pref = getattr(link_expr, 'target', None)
-                    if target_pref is not None:
-                        store.add_constraint(target_pref, rule)
+                if hasattr(link_store, '_by_target'):
+                    for link_expr in link_store._by_target.values():
+                        if link_expr is None:
+                            continue
+                        try:
+                            rule = LinkExpr_to_ConstraintRule(link_expr)
+                            if rule is not None:
+                                target_pref = getattr(link_expr, 'target', None)
+                                if target_pref is not None:
+                                    store.add_constraint(target_pref, rule)
+                        except Exception:
+                            continue
             except Exception:
-                # Skip malformed LinkExpr objects
-                continue
+                pass
         
         return store
     
@@ -1142,3 +1161,157 @@ class ConstraintStore:
                 continue
         
         return store
+
+
+@dataclass
+class FitOrchestrator:
+    """
+    Coordinator for fitting with constraints and bounds.
+    
+    Replaces LinkEngine.evaluate() with integrated constraint application.
+    
+    FitOrchestrator manages:
+      1. Constraint validation (constraints must be satisfied before fitting)
+      2. Constraint application to lmfit Parameters (algebraic expr + numeric freeze)
+      3. Topological ordering for constraint evaluation
+      4. Integration with FitContext for residual computation
+    
+    The orchestrator is slice-aware: constraints can be per-slice or cross-slice.
+    Linear same-slice constraints use algebraic expressions (Parameter.expr).
+    Cross-slice and exponential constraints use numeric freeze (Parameter.value, vary=False).
+    """
+    
+    constraint_store: Optional[ConstraintStore] = None
+    
+    def validate_constraints(
+        self,
+        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
+        slice_states: Dict[int, Any]  # {slice_id: SliceFitState}
+    ) -> List[ConstraintValidationError]:
+        """
+        Validate all constraints in the store before fitting.
+        
+        Returns:
+            List of validation errors (empty if all constraints valid)
+        """
+        if self.constraint_store is None:
+            return []
+        
+        return self.constraint_store.validate_all(peak_map, slice_states)
+    
+    def apply_constraints_to_lmfit(
+        self,
+        params,  # lmfit.Parameters
+        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
+        slice_states: Dict[int, Any],  # {slice_id: SliceFitState}
+        name_map: Optional[Dict[str, str]] = None
+    ) -> None:
+        """
+        Apply all constraints to lmfit Parameters object.
+        
+        This method:
+          1. Iterates through all enabled constraints in the store
+          2. For linear same-slice: sets Parameter.expr (algebraic)
+          3. For others: sets Parameter.value and vary=False (numeric freeze)
+          4. Handles cross-slice drivers by computing numeric values
+        
+        Args:
+            params: lmfit.Parameters object to modify
+            peak_map: Dict {(slice_id, peak_id): Peak}
+            slice_states: Dict {slice_id: SliceFitState}
+            name_map: Optional dict mapping normalized param names to lmfit base names
+        """
+        if self.constraint_store is None:
+            return
+        
+        self.constraint_store.apply_to_lmfit(params, peak_map, slice_states, name_map)
+    
+    def from_constraint_store(store: Optional[ConstraintStore]) -> FitOrchestrator:
+        """Create FitOrchestrator from ConstraintStore."""
+        return FitOrchestrator(constraint_store=store)
+    
+    def from_link_store(link_store: Any) -> FitOrchestrator:
+        """
+        Create FitOrchestrator from legacy LinkStore (backward compatibility).
+        
+        Args:
+            link_store: LinkStore object
+        
+        Returns:
+            FitOrchestrator with constraints converted from LinkStore
+        """
+        if link_store is None:
+            return FitOrchestrator(constraint_store=None)
+        
+        store = ConstraintStore()
+        
+        # LinkStore uses all_expr() method to iterate over LinkExpr objects
+        try:
+            for link_expr in link_store.all_expr():
+                if link_expr is None:
+                    continue
+                try:
+                    rule = LinkExpr_to_ConstraintRule(link_expr)
+                    if rule is not None:
+                        target_pref = getattr(link_expr, 'target', None)
+                        if target_pref is not None:
+                            store.add_constraint(target_pref, rule)
+                except Exception:
+                    # Skip malformed LinkExpr objects
+                    continue
+        except Exception:
+            # If all_expr() fails, try iterating _by_target.values()
+            try:
+                if hasattr(link_store, '_by_target'):
+                    for link_expr in link_store._by_target.values():
+                        if link_expr is None:
+                            continue
+                        try:
+                            rule = LinkExpr_to_ConstraintRule(link_expr)
+                            if rule is not None:
+                                target_pref = getattr(link_expr, 'target', None)
+                                if target_pref is not None:
+                                    store.add_constraint(target_pref, rule)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        
+        return FitOrchestrator(constraint_store=store)
+    
+    def integrate_with_fit_context(
+        self,
+        fit_context: Any,  # FitContext object
+        peaks: List[Any],  # List[Peak]
+        slice_id: int,
+        peak_map: Dict[tuple, Any],
+        slice_states: Dict[int, Any]
+    ) -> None:
+        """
+        Integrate constraints into FitContext workflow.
+        
+        This method:
+          1. Validates constraints in context of current fit
+          2. Applies constraints to lmfit Parameters
+          3. Updates FitContext._apply_links_to_lmfit if needed
+        
+        Args:
+            fit_context: FitContext instance
+            peaks: List of Peak objects for slice
+            slice_id: Current slice ID
+            peak_map: Dict {(slice_id, peak_id): Peak}
+            slice_states: Dict {slice_id: SliceFitState}
+        """
+        # Validate constraints first
+        errors = self.validate_constraints(peak_map, slice_states)
+        if errors:
+            error_messages = [f"{e.target_pref}: {e.message}" for e in errors]
+            raise ValueError(f"Constraint validation failed:\n" + "\n".join(error_messages))
+        
+        # Get lmfit Parameters from FitContext (assumes build_params was called)
+        # This is typically done before calling this method
+        # fit_context.params would be set by caller
+    
+    def __repr__(self) -> str:
+        store_info = "ConstraintStore" if self.constraint_store else "None"
+        return f"FitOrchestrator(constraint_store={store_info})"

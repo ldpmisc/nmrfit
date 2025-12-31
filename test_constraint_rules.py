@@ -1015,6 +1015,199 @@ class TestConstraintRules(unittest.TestCase):
         self.assertEqual(retrieved.a, 2.0)
         self.assertEqual(retrieved.b, 1.0)
 
+    # ========== Phase 5: FitOrchestrator Tests ==========
+    
+    def test_fit_orchestrator_creation(self):
+        """Test FitOrchestrator initialization."""
+        from constraint_rules import FitOrchestrator
+        
+        orchestrator = FitOrchestrator()
+        self.assertIsNone(orchestrator.constraint_store)
+    
+    def test_fit_orchestrator_with_constraint_store(self):
+        """Test FitOrchestrator with ConstraintStore."""
+        from constraint_rules import FitOrchestrator, ConstraintStore
+        
+        store = ConstraintStore()
+        orchestrator = FitOrchestrator(constraint_store=store)
+        
+        self.assertIsNotNone(orchestrator.constraint_store)
+        self.assertIsInstance(orchestrator.constraint_store, ConstraintStore)
+    
+    def test_fit_orchestrator_validate_constraints_empty(self):
+        """Test FitOrchestrator.validate_constraints with empty store."""
+        from constraint_rules import FitOrchestrator
+        
+        orchestrator = FitOrchestrator()
+        errors = orchestrator.validate_constraints({}, {})
+        
+        self.assertEqual(len(errors), 0)
+    
+    def test_fit_orchestrator_validate_constraints_valid(self):
+        """Test FitOrchestrator.validate_constraints with valid constraints."""
+        from constraint_rules import FitOrchestrator, ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        orchestrator = FitOrchestrator(constraint_store=store)
+        
+        # Create peak map
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_p1 = Peak(pos=105.0, amp=60.0, lor_hz=1.2, gauss_disp=0.6)
+        peak_map = {
+            (0, 0): peak_p0,
+            (0, 1): peak_p1
+        }
+        
+        # Validate
+        errors = orchestrator.validate_constraints(peak_map, self.slice_states)
+        self.assertEqual(len(errors), 0)
+    
+    def test_fit_orchestrator_validate_constraints_invalid(self):
+        """Test FitOrchestrator.validate_constraints with invalid constraints."""
+        from constraint_rules import FitOrchestrator, ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        orchestrator = FitOrchestrator(constraint_store=store)
+        
+        # Only target peak, no driver - should generate error
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_map = {
+            (0, 0): peak_p0
+        }
+        
+        # Validate
+        errors = orchestrator.validate_constraints(peak_map, self.slice_states)
+        self.assertGreater(len(errors), 0)
+        self.assertIn("Driver peak not found", errors[0].message)
+    
+    def test_fit_orchestrator_apply_constraints(self):
+        """Test FitOrchestrator.apply_constraints_to_lmfit."""
+        from constraint_rules import FitOrchestrator, ConstraintStore
+        from lmfit import Parameters
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        orchestrator = FitOrchestrator(constraint_store=store)
+        
+        # Create peak map
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_p1 = Peak(pos=105.0, amp=60.0, lor_hz=1.2, gauss_disp=0.6)
+        peak_map = {
+            (0, 0): peak_p0,
+            (0, 1): peak_p1
+        }
+        
+        # Create lmfit parameters
+        params = Parameters()
+        params.add('amp_0', value=50.0, vary=True)
+        params.add('amp_1', value=60.0, vary=True)
+        params.add('pos_0', value=100.0, vary=True)
+        params.add('pos_1', value=105.0, vary=True)
+        
+        # Apply constraints via orchestrator
+        orchestrator.apply_constraints_to_lmfit(params, peak_map, self.slice_states)
+        
+        # Check that amp_0 has expression
+        p_amp_0 = params.get('amp_0')
+        self.assertIsNotNone(p_amp_0)
+        self.assertIsNotNone(p_amp_0.expr)
+        self.assertIn('amp_1', p_amp_0.expr)
+    
+    def test_fit_orchestrator_from_constraint_store(self):
+        """Test FitOrchestrator.from_constraint_store static method."""
+        from constraint_rules import FitOrchestrator, ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        # Create via static method
+        orchestrator = FitOrchestrator.from_constraint_store(store)
+        
+        self.assertIsNotNone(orchestrator.constraint_store)
+        self.assertEqual(len(orchestrator.constraint_store.constraints), 1)
+    
+    def test_fit_orchestrator_from_link_store(self):
+        """Test FitOrchestrator.from_link_store static method."""
+        from constraint_rules import FitOrchestrator
+        from nmrFit_v0 import LinkStore, LinkExpr, LinkType
+        
+        # Create a legacy LinkStore
+        link_store = LinkStore()
+        
+        expr = LinkExpr(
+            type=LinkType.LINEAR,
+            target=self.pref_s0_p0_amp,
+            driver=self.pref_s0_p1_amp,
+            args={'a': 2.0, 'b': 1.0},
+            enabled=True
+        )
+        link_store.set_link(expr)
+        
+        # Create orchestrator via from_link_store
+        orchestrator = FitOrchestrator.from_link_store(link_store)
+        
+        self.assertIsNotNone(orchestrator.constraint_store)
+        self.assertEqual(len(orchestrator.constraint_store.constraints), 1)
+    
+    def test_fit_orchestrator_from_link_store_none(self):
+        """Test FitOrchestrator.from_link_store with None."""
+        from constraint_rules import FitOrchestrator
+        
+        orchestrator = FitOrchestrator.from_link_store(None)
+        
+        self.assertIsNone(orchestrator.constraint_store)
+    
+    def test_fit_orchestrator_repr(self):
+        """Test FitOrchestrator string representation."""
+        from constraint_rules import FitOrchestrator, ConstraintStore
+        
+        # Empty orchestrator
+        orchestrator1 = FitOrchestrator()
+        repr1 = repr(orchestrator1)
+        self.assertIn("None", repr1)
+        
+        # With constraint store
+        orchestrator2 = FitOrchestrator(constraint_store=ConstraintStore())
+        repr2 = repr(orchestrator2)
+        self.assertIn("ConstraintStore", repr2)
+
 
 if __name__ == "__main__":
     unittest.main()
