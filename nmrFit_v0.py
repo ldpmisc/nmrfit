@@ -95,6 +95,16 @@ from PyQt5.QtGui import QDoubleValidator
 
 from stats_extract import extract_FitResult_corr_and_sum
 from stats_view import StatsView
+from constraint_rules import (
+    ConstraintRule,
+    LinearConstraint,
+    RelaxDecayConstraint,
+    ConstraintRuleFactory,
+    LinkExpr_to_ConstraintRule,
+    ConstraintRule_to_LinkExpr,
+    ConstrainedPeak,
+    ConstraintStore,
+)
 
 import os
 os.environ["QT_API"] = "pyqt5"
@@ -145,6 +155,8 @@ class Peak:
 class SliceFitState:
     
     peaks: List[Peak] = field(default_factory=list)                         # deep copy of fitted/display peaks
+    constrained_peaks: List[Any] = field(default_factory=list)              # Phase 2: List[ConstrainedPeak] for constraint management
+    constraint_store: Optional[Any] = None                                  # Phase 3: Optional[ConstraintStore] for per-slice constraint registry
     fix_flags: List[Tuple[bool,bool,bool,bool]] = field(default_factory=list)  # per-peak (pos, area, lor, gauss), True = fixed
     x_disp: np.ndarray = None                       # display x used for plotting
     y_data: np.ndarray = None                       # data trace used for plotting

@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
 from enum import Enum
 import numpy as np
 
-from nmrFit_v0 import ParamRef, Peak
+# Use TYPE_CHECKING to avoid circular import at runtime
+# nmrFit_v0 → constraint_rules, constraint_rules → nmrFit_v0 creates cycle
+if TYPE_CHECKING:
+    from nmrFit_v0 import ParamRef, Peak, LinkExpr, LinkType
 
 
 class ConstraintType(Enum):
@@ -16,7 +21,7 @@ class ConstraintType(Enum):
 @dataclass
 class ConstraintValidationError:
     """Container for constraint validation errors."""
-    target_pref: ParamRef
+    target_pref: Any  # ParamRef (deferred to avoid circular import)
     message: str
 
 
@@ -258,7 +263,7 @@ class LinearConstraint(ConstraintRule):
         return f"s{pref.slice_id}_p{pref.peak_id}_{pref.name}"
 
 
-class RelaxExponentialConstraint(ConstraintRule):
+class RelaxDecayConstraint(ConstraintRule):
     """
     Relaxation exponential constraint: target = driver * A * exp(-t / T) + C
     
@@ -442,12 +447,15 @@ class ConstraintRuleFactory:
             [T_seconds, A, C, time_seconds, T_name]: for RELAX_EXP
             [enabled]: True/False
         """
+        # Import at function level to avoid circular dependency
+        from nmrFit_v0 import ParamRef as _ParamRef
+        
         constraint_type = str(data.get("type", "LINEAR")).upper()
         enabled = data.get("enabled", True)
         
         # Parse target
         target_data = data.get("target_pref", {})
-        target_pref = ParamRef(
+        target_pref = _ParamRef(
             slice_id=int(target_data["slice_id"]),
             peak_id=int(target_data["peak_id"]),
             name=str(target_data["name"])
@@ -457,7 +465,7 @@ class ConstraintRuleFactory:
             driver_data = data.get("driver_pref")
             driver_pref = None
             if driver_data is not None:
-                driver_pref = ParamRef(
+                driver_pref = _ParamRef(
                     slice_id=int(driver_data["slice_id"]),
                     peak_id=int(driver_data["peak_id"]),
                     name=str(driver_data["name"])
@@ -473,13 +481,13 @@ class ConstraintRuleFactory:
         
         elif constraint_type == "RELAX_EXP":
             driver_data = data.get("driver_pref")
-            driver_pref = ParamRef(
+            driver_pref = _ParamRef(
                 slice_id=int(driver_data["slice_id"]),
                 peak_id=int(driver_data["peak_id"]),
                 name=str(driver_data["name"])
             )
             
-            return RelaxExponentialConstraint(
+            return RelaxDecayConstraint(
                 target_pref=target_pref,
                 driver_pref=driver_pref,
                 T_seconds=float(data.get("T_seconds", 1.0)),
@@ -516,7 +524,7 @@ class ConstraintRuleFactory:
             result["a"] = rule.a
             result["b"] = rule.b
         
-        elif isinstance(rule, RelaxExponentialConstraint):
+        elif isinstance(rule, RelaxDecayConstraint):
             result["driver_pref"] = {
                 "slice_id": rule.driver_pref.slice_id,
                 "peak_id": rule.driver_pref.peak_id,
@@ -531,3 +539,606 @@ class ConstraintRuleFactory:
                 result["T_name"] = rule.T_name
         
         return result
+
+
+# ============================================================================
+# Migration Bridge: LinkExpr → ConstraintRule
+# ============================================================================
+
+def LinkExpr_to_ConstraintRule(link_expr) -> ConstraintRule:
+    """
+    Convert old LinkExpr to new ConstraintRule subclass.
+    
+    This function enables backward compatibility when loading existing fit files
+    that use the deprecated LinkExpr format. It maps:
+      - LinkExpr(type=LINEAR) → LinearConstraint
+      - LinkExpr(type=RELAX_EXP) → RelaxDecayConstraint
+    
+    Args:
+        link_expr: LinkExpr instance with type, target, driver, args, enabled
+        
+    Returns:
+        ConstraintRule subclass instance (LinearConstraint or RelaxDecayConstraint)
+        
+    Raises:
+        ValueError: if link_expr.type is unknown
+    """
+    # Import at function level to avoid circular dependency
+    from nmrFit_v0 import LinkType as _LinkType
+    
+    if link_expr.type == _LinkType.LINEAR:
+        return LinearConstraint(
+            target_pref=link_expr.target,
+            driver_pref=link_expr.driver,
+            a=link_expr.args.get("a", 1.0),
+            b=link_expr.args.get("b", 0.0),
+            enabled=link_expr.enabled
+        )
+    
+    elif link_expr.type == _LinkType.RELAX_EXP:
+        return RelaxDecayConstraint(
+            target_pref=link_expr.target,
+            driver_pref=link_expr.driver,
+            T_seconds=link_expr.args.get("T", 1.0),
+            A=link_expr.args.get("A", 1.0),
+            C=link_expr.args.get("C", 0.0),
+            time_seconds=link_expr.args.get("t_override"),
+            T_name=link_expr.args.get("T_name"),
+            enabled=link_expr.enabled
+        )
+    
+    else:
+        raise ValueError(f"Unknown link type in LinkExpr: {link_expr.type}")
+
+
+def ConstraintRule_to_LinkExpr(rule: ConstraintRule):
+    """
+    Convert new ConstraintRule to old LinkExpr format.
+    
+    This function enables backward compatibility when exporting to the old
+    LinkExpr format. It is the inverse of LinkExpr_to_ConstraintRule.
+    
+    Args:
+        rule: ConstraintRule subclass instance
+        
+    Returns:
+        LinkExpr instance with type, target, driver, args, enabled
+        
+    Raises:
+        ValueError: if rule type is unknown
+    """
+    # Import at function level to avoid circular dependency
+    from nmrFit_v0 import LinkExpr as _LinkExpr, LinkType as _LinkType
+    
+    if isinstance(rule, LinearConstraint):
+        return _LinkExpr(
+            type=_LinkType.LINEAR,
+            target=rule.target_pref,
+            driver=rule.driver_pref,
+            args={"a": rule.a, "b": rule.b},
+            enabled=rule.enabled
+        )
+    
+    elif isinstance(rule, RelaxDecayConstraint):
+        args = {
+            "T": rule.T_seconds,
+            "A": rule.A,
+            "C": rule.C
+        }
+        if rule.time_seconds is not None:
+            args["t_override"] = rule.time_seconds
+        if rule.T_name is not None:
+            args["T_name"] = rule.T_name
+        
+        return _LinkExpr(
+            type=_LinkType.RELAX_EXP,
+            target=rule.target_pref,
+            driver=rule.driver_pref,
+            args=args,
+            enabled=rule.enabled
+        )
+    
+    else:
+        raise ValueError(f"Unknown constraint rule type: {type(rule)}")
+
+
+# ============================================================================
+# ConstrainedPeak Aggregate: Wraps Peak + Constraints Dictionary
+# ============================================================================
+
+@dataclass
+class ConstrainedPeak:
+    """
+    Aggregate that combines a Peak with its associated constraints.
+    
+    This is the core entity in the Aggregate Pattern for constraint management.
+    Each ConstrainedPeak manages:
+      1. A single Peak (amplitude, position, widths)
+      2. A dictionary of ConstraintRules keyed by parameter name
+      3. Validation and application of constraints to lmfit
+    
+    Attributes:
+        peak: The Peak object (pos, amp, lor_hz, gauss_disp)
+        constraints: Dict[str, ConstraintRule] mapping param names to rules
+                     Example: {"amp": LinearConstraint(...), "pos": RelaxDecayConstraint(...)}
+    """
+    peak: Any  # Peak (deferred type to avoid circular import)
+    constraints: Dict[str, ConstraintRule] = field(default_factory=dict)
+    
+    def get_constraint(self, param_name: str) -> Optional[ConstraintRule]:
+        """
+        Retrieve a constraint for a given parameter name.
+        
+        Args:
+            param_name: Name of parameter ("pos", "amp", "lor", "gauss")
+            
+        Returns:
+            ConstraintRule if one is registered, else None
+        """
+        return self.constraints.get(str(param_name).lower(), None)
+    
+    def set_constraint(self, param_name: str, rule: Optional[ConstraintRule]) -> None:
+        """
+        Register or unregister a constraint for a parameter.
+        
+        Args:
+            param_name: Name of parameter ("pos", "amp", "lor", "gauss")
+            rule: ConstraintRule to register, or None to clear
+        """
+        pname = str(param_name).lower()
+        if rule is None:
+            self.constraints.pop(pname, None)
+        else:
+            self.constraints[pname] = rule
+    
+    def validate(
+        self,
+        target_pref: Any,  # ParamRef (deferred type)
+        driver_peaks: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
+        slice_states: Dict[int, Any]  # {slice_id: SliceFitState}
+    ) -> List[ConstraintValidationError]:
+        """
+        Validate all constraints for this peak.
+        
+        Args:
+            target_pref: ParamRef identifying this peak's slice and peak_id
+            driver_peaks: Dict mapping (slice_id, peak_id) → Peak for all drivers
+            slice_states: Dict mapping slice_id → SliceFitState
+            
+        Returns:
+            List of ConstraintValidationError for any validation failures (empty if valid)
+        """
+        errors: List[ConstraintValidationError] = []
+        
+        for param_name, rule in self.constraints.items():
+            if rule is None or not getattr(rule, 'enabled', True):
+                continue
+            
+            # Find driver peak if needed
+            driver_pref = getattr(rule, 'driver_pref', None)
+            driver_peak = None
+            if driver_pref is not None:
+                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
+                driver_peak = driver_peaks.get(driver_key, None)
+            
+            # Validate constraint
+            try:
+                validation_errors = rule.validate(
+                    target_peak=self.peak,
+                    target_pref=target_pref,
+                    driver_peak=driver_peak,
+                    driver_pref=driver_pref,
+                    slice_states=slice_states
+                )
+                
+                for error_msg in validation_errors:
+                    errors.append(ConstraintValidationError(
+                        target_pref=target_pref,
+                        message=f"Parameter '{param_name}': {error_msg}"
+                    ))
+            except Exception as e:
+                errors.append(ConstraintValidationError(
+                    target_pref=target_pref,
+                    message=f"Parameter '{param_name}': Validation exception: {str(e)}"
+                ))
+        
+        return errors
+    
+    def apply_constraints_to_lmfit(
+        self,
+        params: Any,  # lmfit.Parameters
+        target_pref: Any,  # ParamRef
+        driver_peaks: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
+        slice_states: Dict[int, Any],  # {slice_id: SliceFitState}
+        name_map: Optional[Dict[str, str]] = None  # {normalized_name: lmfit_base_name}
+    ) -> None:
+        """
+        Apply all enabled constraints to an lmfit Parameters object.
+        
+        This method:
+          1. Evaluates each constraint to compute target values
+          2. Sets lmfit Parameter.expr (for linear same-slice) or .value/.vary (for others)
+          3. Handles cross-slice drivers by freezing with numeric values
+        
+        Args:
+            params: lmfit.Parameters object to modify
+            target_pref: ParamRef identifying this peak (slice_id, peak_id)
+            driver_peaks: Dict {(slice_id, peak_id): Peak}
+            slice_states: Dict {slice_id: SliceFitState}
+            name_map: Optional dict mapping normalized param names to lmfit base names
+                      Default: {"pos": "pos", "amp": "amp", "lor": "lor", "gauss": "gauss"}
+        """
+        if name_map is None:
+            name_map = {"pos": "pos", "amp": "amp", "lor": "lor", "gauss": "gauss"}
+        
+        def _norm(n: str) -> str:
+            return (n or "").strip().lower()
+        
+        for param_name, rule in self.constraints.items():
+            if rule is None or not getattr(rule, 'enabled', True):
+                continue
+            
+            # Resolve lmfit parameter name
+            base_name = name_map.get(_norm(param_name))
+            if not base_name:
+                continue
+            
+            peak_id = int(target_pref.peak_id)
+            key_tgt = f"{base_name}_{peak_id}"  # e.g., "amp_0", "pos_1"
+            p_tgt = params.get(key_tgt, None)
+            if p_tgt is None:
+                continue
+            
+            # Find driver peak
+            driver_pref = getattr(rule, 'driver_pref', None)
+            driver_peak = None
+            if driver_pref is not None:
+                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
+                driver_peak = driver_peaks.get(driver_key, None)
+            
+            # Evaluate constraint to get target value
+            try:
+                evaluated_value = rule.evaluate(
+                    target_peak=self.peak,
+                    target_pref=target_pref,
+                    driver_peak=driver_peak,
+                    driver_pref=driver_pref,
+                    slice_states=slice_states
+                )
+            except Exception:
+                # If evaluation fails, skip this constraint
+                continue
+            
+            # Apply to lmfit based on constraint type and driver location
+            target_slice = int(target_pref.slice_id)
+            
+            # For LinearConstraint with same-slice driver: use algebraic expression
+            if (isinstance(rule, LinearConstraint) and 
+                driver_pref is not None and 
+                int(driver_pref.slice_id) == target_slice):
+                
+                driver_base = name_map.get(_norm(driver_pref.name))
+                if driver_base:
+                    driver_peak_id = int(driver_pref.peak_id)
+                    key_drv = f"{driver_base}_{driver_peak_id}"
+                    
+                    if key_drv in params:
+                        a = float(getattr(rule, 'a', 1.0))
+                        b = float(getattr(rule, 'b', 0.0))
+                        expr = f"{key_drv}*{a}+{b}"
+                        try:
+                            p_tgt.set(value=float(evaluated_value), expr=expr)
+                        except Exception:
+                            p_tgt.set(value=float(evaluated_value), vary=False)
+                        continue
+            
+            # All other cases: numeric freeze
+            try:
+                p_tgt.set(value=float(evaluated_value), vary=False)
+            except Exception:
+                pass
+
+
+@dataclass
+class ConstraintStore:
+    """
+    Per-slice registry for constraints indexed by ParamRef.
+    
+    ConstraintStore manages all constraints for a single slice, providing:
+      - Registry: Dict[ParamRef, ConstraintRule]
+      - Validation: validate_all() method with error collection
+      - Application: apply_to_lmfit() for coordinated constraint application
+      - Backward compatibility: from_LinkStore() converter
+    
+    The store maintains a reverse index for efficient dependent lookup during
+    constraint application.
+    """
+    
+    constraints: Dict[Any, ConstraintRule] = field(default_factory=dict)  # {ParamRef → ConstraintRule}
+    reverse_index: Dict[Any, List[Any]] = field(default_factory=dict)  # {ParamRef(driver) → [ParamRef(targets)]}
+    
+    def __post_init__(self):
+        """Rebuild reverse index after initialization."""
+        self._rebuild_reverse_index()
+    
+    def _rebuild_reverse_index(self) -> None:
+        """Rebuild the reverse index mapping drivers to targets."""
+        self.reverse_index.clear()
+        for target_pref, rule in self.constraints.items():
+            if rule is None or not getattr(rule, 'enabled', True):
+                continue
+            driver_pref = getattr(rule, 'driver_pref', None)
+            if driver_pref is not None:
+                if driver_pref not in self.reverse_index:
+                    self.reverse_index[driver_pref] = []
+                self.reverse_index[driver_pref].append(target_pref)
+    
+    def add_constraint(self, target_pref: Any, rule: Optional[ConstraintRule]) -> None:
+        """
+        Register or unregister a constraint.
+        
+        Args:
+            target_pref: ParamRef identifying the target parameter
+            rule: ConstraintRule to apply, or None to unregister
+        """
+        if rule is None:
+            self.constraints.pop(target_pref, None)
+        else:
+            self.constraints[target_pref] = rule
+        self._rebuild_reverse_index()
+    
+    def get_constraint(self, target_pref: Any) -> Optional[ConstraintRule]:
+        """Retrieve constraint for a target ParamRef."""
+        return self.constraints.get(target_pref, None)
+    
+    def get_dependents(self, driver_pref: Any) -> List[Any]:
+        """
+        Get all target ParamRefs that depend on a driver.
+        
+        Args:
+            driver_pref: ParamRef of driver parameter
+        
+        Returns:
+            List of ParamRef objects for targets (empty if no dependents)
+        """
+        return self.reverse_index.get(driver_pref, [])
+    
+    def validate_all(
+        self,
+        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
+        slice_states: Dict[int, Any]  # {slice_id: SliceFitState}
+    ) -> List[ConstraintValidationError]:
+        """
+        Validate all constraints in the store.
+        
+        Args:
+            peak_map: Dict {(slice_id, peak_id): Peak}
+            slice_states: Dict {slice_id: SliceFitState}
+        
+        Returns:
+            List of ConstraintValidationError (empty if all valid)
+        """
+        errors = []
+        
+        for target_pref, rule in self.constraints.items():
+            if rule is None or not getattr(rule, 'enabled', True):
+                continue
+            
+            # Resolve target peak
+            target_key = (int(target_pref.slice_id), int(target_pref.peak_id))
+            target_peak = peak_map.get(target_key, None)
+            if target_peak is None:
+                errors.append(ConstraintValidationError(
+                    target_pref=target_pref,
+                    message=f"Target peak not found: {target_key}"
+                ))
+                continue
+            
+            # Resolve driver peak (if any)
+            driver_pref = getattr(rule, 'driver_pref', None)
+            driver_peak = None
+            if driver_pref is not None:
+                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
+                driver_peak = peak_map.get(driver_key, None)
+                if driver_peak is None:
+                    errors.append(ConstraintValidationError(
+                        target_pref=target_pref,
+                        message=f"Driver peak not found: {driver_key}"
+                    ))
+                    continue
+            
+            # Validate constraint
+            try:
+                error_msgs = rule.validate(
+                    target_peak=target_peak,
+                    target_pref=target_pref,
+                    driver_peak=driver_peak,
+                    driver_pref=driver_pref,
+                    slice_states=slice_states
+                )
+                for msg in error_msgs:
+                    errors.append(ConstraintValidationError(
+                        target_pref=target_pref,
+                        message=msg
+                    ))
+            except Exception as e:
+                errors.append(ConstraintValidationError(
+                    target_pref=target_pref,
+                    message=f"Validation exception: {str(e)}"
+                ))
+        
+        return errors
+    
+    def apply_to_lmfit(
+        self,
+        params,
+        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
+        slice_states: Dict[int, Any],  # {slice_id: SliceFitState}
+        name_map: Optional[Dict[str, str]] = None
+    ) -> None:
+        """
+        Apply all constraints to an lmfit Parameters object.
+        
+        Args:
+            params: lmfit.Parameters object to modify
+            peak_map: Dict {(slice_id, peak_id): Peak}
+            slice_states: Dict {slice_id: SliceFitState}
+            name_map: Optional dict mapping normalized param names to lmfit base names
+        """
+        if name_map is None:
+            name_map = {"pos": "pos", "amp": "amp", "lor": "lor", "gauss": "gauss"}
+        
+        def _norm(n: str) -> str:
+            return (n or "").strip().lower()
+        
+        for target_pref, rule in self.constraints.items():
+            if rule is None or not getattr(rule, 'enabled', True):
+                continue
+            
+            # Resolve target peak
+            target_key = (int(target_pref.slice_id), int(target_pref.peak_id))
+            target_peak = peak_map.get(target_key, None)
+            if target_peak is None:
+                continue
+            
+            # Resolve driver peak (if any)
+            driver_pref = getattr(rule, 'driver_pref', None)
+            driver_peak = None
+            if driver_pref is not None:
+                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
+                driver_peak = peak_map.get(driver_key, None)
+            
+            # Resolve lmfit parameter name
+            base_name = name_map.get(_norm(target_pref.name))
+            if not base_name:
+                continue
+            
+            peak_id = int(target_pref.peak_id)
+            key_tgt = f"{base_name}_{peak_id}"
+            p_tgt = params.get(key_tgt, None)
+            if p_tgt is None:
+                continue
+            
+            # Evaluate constraint
+            try:
+                evaluated_value = rule.evaluate(
+                    target_peak=target_peak,
+                    target_pref=target_pref,
+                    driver_peak=driver_peak,
+                    driver_pref=driver_pref,
+                    slice_states=slice_states
+                )
+            except Exception:
+                continue
+            
+            # Apply to lmfit based on constraint type and driver location
+            target_slice = int(target_pref.slice_id)
+            
+            # For LinearConstraint with same-slice driver: use algebraic expression
+            if (isinstance(rule, LinearConstraint) and 
+                driver_pref is not None and 
+                int(driver_pref.slice_id) == target_slice):
+                
+                driver_base = name_map.get(_norm(driver_pref.name))
+                if driver_base:
+                    driver_peak_id = int(driver_pref.peak_id)
+                    key_drv = f"{driver_base}_{driver_peak_id}"
+                    
+                    if key_drv in params:
+                        a = float(getattr(rule, 'a', 1.0))
+                        b = float(getattr(rule, 'b', 0.0))
+                        expr = f"{key_drv}*{a}+{b}"
+                        try:
+                            p_tgt.set(value=float(evaluated_value), expr=expr)
+                        except Exception:
+                            p_tgt.set(value=float(evaluated_value), vary=False)
+                        continue
+            
+            # All other cases: numeric freeze
+            try:
+                p_tgt.set(value=float(evaluated_value), vary=False)
+            except Exception:
+                pass
+    
+    @staticmethod
+    def from_LinkStore(link_store: Any) -> ConstraintStore:
+        """
+        Create ConstraintStore from legacy LinkStore (backward compatibility).
+        
+        Args:
+            link_store: LinkStore object with links list
+        
+        Returns:
+            ConstraintStore with constraints converted from LinkExpr objects
+        """
+        store = ConstraintStore()
+        
+        if link_store is None or not hasattr(link_store, 'links'):
+            return store
+        
+        for link_expr in link_store.links:
+            if link_expr is None:
+                continue
+            try:
+                rule = LinkExpr_to_ConstraintRule(link_expr)
+                if rule is not None:
+                    target_pref = getattr(link_expr, 'target', None)
+                    if target_pref is not None:
+                        store.add_constraint(target_pref, rule)
+            except Exception:
+                # Skip malformed LinkExpr objects
+                continue
+        
+        return store
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize ConstraintStore to JSON-compatible dict.
+        
+        Returns:
+            Dict with 'constraints' key containing serialized rules
+        """
+        constraints_dict = {}
+        for pref, rule in self.constraints.items():
+            pref_key = f"s{pref.slice_id}_p{pref.peak_id}_{pref.name}"
+            if rule is not None:
+                constraints_dict[pref_key] = ConstraintRuleFactory.to_dict(rule)
+        
+        return {
+            "constraints": constraints_dict
+        }
+    
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> ConstraintStore:
+        """
+        Deserialize ConstraintStore from JSON dict.
+        
+        Args:
+            data: Dict with 'constraints' key
+        
+        Returns:
+            ConstraintStore instance
+        """
+        store = ConstraintStore()
+        
+        constraints_dict = data.get("constraints", {})
+        for pref_key, rule_data in constraints_dict.items():
+            try:
+                rule = ConstraintRuleFactory.from_dict(rule_data)
+                if rule is not None:
+                    # Parse pref_key: "s{slice}_p{peak}_{name}"
+                    parts = pref_key.split('_', 2)
+                    if len(parts) >= 3 and parts[0].startswith('s') and parts[1].startswith('p'):
+                        slice_id = int(parts[0][1:])
+                        peak_id = int(parts[1][1:])
+                        name = parts[2]
+                        
+                        # Import ParamRef lazily to avoid circular import
+                        from nmrFit_v0 import ParamRef
+                        pref = ParamRef(slice_id=slice_id, peak_id=peak_id, name=name)
+                        store.add_constraint(pref, rule)
+            except Exception:
+                # Skip malformed constraint data
+                continue
+        
+        return store

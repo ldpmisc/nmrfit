@@ -763,6 +763,259 @@ class TestConstraintRules(unittest.TestCase):
         self.assertIsNotNone(cp.get_constraint("amp"))
         self.assertIsNotNone(cp.get_constraint("pos"))
 
+    # ========== Phase 3: ConstraintStore Registry Tests ==========
+    
+    def test_constraint_store_creation(self):
+        """Test ConstraintStore initialization."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        self.assertEqual(len(store.constraints), 0)
+        self.assertEqual(len(store.reverse_index), 0)
+    
+    def test_constraint_store_add_constraint(self):
+        """Test adding constraints to ConstraintStore."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        self.assertEqual(len(store.constraints), 1)
+        retrieved = store.get_constraint(self.pref_s0_p0_amp)
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.a, 2.0)
+    
+    def test_constraint_store_remove_constraint(self):
+        """Test removing constraints from ConstraintStore."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        self.assertEqual(len(store.constraints), 1)
+        
+        store.add_constraint(self.pref_s0_p0_amp, None)
+        self.assertEqual(len(store.constraints), 0)
+    
+    def test_constraint_store_reverse_index(self):
+        """Test reverse index for dependent tracking."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        # Add constraint: p0_amp depends on p1_amp
+        rule1 = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule1)
+        
+        # Check reverse index
+        dependents = store.get_dependents(self.pref_s0_p1_amp)
+        self.assertEqual(len(dependents), 1)
+        self.assertIn(self.pref_s0_p0_amp, dependents)
+    
+    def test_constraint_store_multiple_dependents(self):
+        """Test reverse index with multiple dependents on same driver."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        # p0_amp depends on p1_amp
+        rule1 = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule1)
+        
+        # p0_pos also depends on p1_amp (same driver)
+        rule2 = LinearConstraint(
+            target_pref=self.pref_s0_p0_pos,
+            driver_pref=self.pref_s0_p1_amp,
+            a=1.5,
+            b=0.5,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_pos, rule2)
+        
+        # Check reverse index
+        dependents = store.get_dependents(self.pref_s0_p1_amp)
+        self.assertEqual(len(dependents), 2)
+        self.assertIn(self.pref_s0_p0_amp, dependents)
+        self.assertIn(self.pref_s0_p0_pos, dependents)
+    
+    def test_constraint_store_validate_all_success(self):
+        """Test validate_all with valid constraints."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        # Create peak map
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_p1 = Peak(pos=105.0, amp=60.0, lor_hz=1.2, gauss_disp=0.6)
+        peak_map = {
+            (0, 0): peak_p0,
+            (0, 1): peak_p1
+        }
+        
+        # Validate
+        errors = store.validate_all(peak_map, self.slice_states)
+        self.assertEqual(len(errors), 0)
+    
+    def test_constraint_store_validate_all_missing_driver(self):
+        """Test validate_all with missing driver peak."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        # Only target peak, no driver
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_map = {
+            (0, 0): peak_p0
+        }
+        
+        # Validate
+        errors = store.validate_all(peak_map, self.slice_states)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Driver peak not found", errors[0].message)
+    
+    def test_constraint_store_validate_all_disabled(self):
+        """Test validate_all skips disabled constraints."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=False  # Disabled
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        # Only target peak, no driver
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_map = {
+            (0, 0): peak_p0
+        }
+        
+        # Validate - should skip disabled constraint
+        errors = store.validate_all(peak_map, self.slice_states)
+        self.assertEqual(len(errors), 0)
+    
+    def test_constraint_store_apply_to_lmfit(self):
+        """Test apply_to_lmfit with ConstraintStore."""
+        from constraint_rules import ConstraintStore
+        from lmfit import Parameters
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        # Create peak map
+        peak_p0 = Peak(pos=100.0, amp=50.0, lor_hz=1.0, gauss_disp=0.5)
+        peak_p1 = Peak(pos=105.0, amp=60.0, lor_hz=1.2, gauss_disp=0.6)
+        peak_map = {
+            (0, 0): peak_p0,
+            (0, 1): peak_p1
+        }
+        
+        # Create lmfit parameters
+        params = Parameters()
+        params.add('amp_0', value=50.0, vary=True)
+        params.add('amp_1', value=60.0, vary=True)
+        params.add('pos_0', value=100.0, vary=True)
+        params.add('pos_1', value=105.0, vary=True)
+        
+        # Apply constraints
+        store.apply_to_lmfit(params, peak_map, self.slice_states)
+        
+        # Check that amp_0 has expression
+        p_amp_0 = params.get('amp_0')
+        self.assertIsNotNone(p_amp_0)
+        self.assertIsNotNone(p_amp_0.expr)
+        self.assertIn('amp_1', p_amp_0.expr)
+    
+    def test_constraint_store_serialization(self):
+        """Test ConstraintStore to_dict and from_dict."""
+        from constraint_rules import ConstraintStore
+        
+        store = ConstraintStore()
+        
+        rule = LinearConstraint(
+            target_pref=self.pref_s0_p0_amp,
+            driver_pref=self.pref_s0_p1_amp,
+            a=2.0,
+            b=1.0,
+            enabled=True
+        )
+        store.add_constraint(self.pref_s0_p0_amp, rule)
+        
+        # Serialize
+        data = store.to_dict()
+        self.assertIn('constraints', data)
+        self.assertGreater(len(data['constraints']), 0)
+        
+        # Deserialize
+        store2 = ConstraintStore.from_dict(data)
+        self.assertEqual(len(store2.constraints), 1)
+        
+        # Check deserialized rule
+        retrieved = store2.get_constraint(self.pref_s0_p0_amp)
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.a, 2.0)
+        self.assertEqual(retrieved.b, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
