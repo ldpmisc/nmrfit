@@ -15,49 +15,47 @@ Stack
 - lmfit
 - numpy
 
-Notes
------
-1) Axis units: you can load data in **ppm** or **Hz**. Set the combo box
-   accordingly. If ppm is selected, you MUST also set the reference
-   frequency (MHz) so the code can convert ppm↔Hz.
-2) Spectral Width (SW): if you don’t enter SW (Hz), it will be inferred
-   from the x-axis range (in Hz) as SW ≈ |x_max - x_min|. If you know the
-   true SW of acquisition, type it for better accuracy.
-3) This file includes a minimal loader for two-column text files.
-   To plug in your own `open_file-v3` loader, scroll to `load_spectrum()`
-   and replace the placeholder with your function. Just return x, y, and
-   optionally metadata.
-
 Usage
 -----
 python mpFit.py
 
-Click "Open" → select your spectrum (two columns: x, y). Choose axis
-units (ppm/Hz), set reference frequency if needed, then:
-- Click directly on the plot to add peaks at clicked x.S
+Click "Open" → select your spectrum. Currently only support .json input data from ssnake
+Future versions will include Bruker and .txt file.
+
+Choose axis units (ppm/Hz), set reference frequency if needed, then:
+- Click on Add peak modes to enable add peak function
 - Use the Peak Table to tweak initial guesses (Pos, Amp, Lorentz, Gauss).
-- Press "Fit" to run lmfit. The model and residual will show on the plot.
-- Use "Auto-Pick" (optional) to detect top N peaks.
-- "Save CSV" writes parameters and fit metrics to a CSV.
+- Press "Fit" to select a desired mode of fitting.
+- Click Show Stat to see Statistic detail.
+- Click Excluded to open excluded functions to add an excluded region for data. The excluded region will be masked and will not influence the residual
+- Right click on a parameter cell in the Peak Table to set Link or Bounds. Link is to set mathematical relations between parameters. Bounds are to set limits on a parameter.
+- Click File -> Export or Import to export or import peak table in .txt format.
+
+
+Notes
+-----
+1) The auto-pick function is not working currently
+
+2) The option to switch a display from ppm to Hz is not working currently. The software only works properly in ppm.
+
+3) The fitting is taking input in ppm except for Lorentz width. The input is internally converted to Hz and optimization take place in Hz.
+
 
 Design
 ------
-The design centers around the ParamRef objects.
+The design centers around the SliceFitState and ParamRef objects.
 
 When user make a peak, either by click on plot or add one in a table, or import from a table, a Peak object is created.
 Peak object --> Peaks[List] aka a list of Peaks
-Peaks[List] <--> Peak <--> ParamRef object <--> key <--> lmfit.Parameter object -> lmfit.Parameters object
-
-For 2D data, --> multi slice. the data of each slice () is cached in a FitSliceState object.
+Peak[List] --> SliceFitState object (Peak[List] is stored in SliceFitState object, one per slice (1D data has one slice)).
+Peaks[List] <--> Peak --> ParamRef object <--> key --> lmfit.Parameter object -> lmfit.Parameters object <--> lmfit.minimize()
 
 When creating a link between fitting parameters (e.g s0_p0_pos = s1_p0_pos), the link is a linkExpr object. The object and alike are stored in linkStore. 
 Fetching linkStore gives linkExpr and ParamRef. Use ParamRef to call Parameter object from Parameters. Use linkExpr to find a link expression of a Parameter object.
 Use Parameter.set() to set an expression and forward that to lmfit.minimize()
 In short, User set a link --> LinkExpr <--> LinkStore --> ParamRef --> lmfit.Parameter --> lmfit.Parameters --> lmfit.minimize()
 
-When setting a bound of a fitting parameter (e.g 90 < s0_p0_pos < 100 ppm).
-
- 
+When setting a bound of a fitting parameter (e.g 90 < s0_p0_pos < 100 ppm). ....
 
 
 Copyright
@@ -95,7 +93,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QDoubleValidator
 
-from stats_extract import extract_FitResult_and_corr
+from stats_extract import extract_FitResult_corr_and_sum
 from stats_view import StatsView
 
 import os
@@ -408,7 +406,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     def _reload(self):
         self.tbl.blockSignals(True)
         self.tbl.setRowCount(0)
-        self._row_targets.clear()   # NEW: keep “row → ParamRef” mapping
+        self._row_targets.clear()   # keep “row → ParamRef” mapping
         for expr in self._link_store.all_expr():
             row = self.tbl.rowCount()
             self.tbl.insertRow(row)
@@ -426,7 +424,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
             tgt_item = QtWidgets.QTableWidgetItem(tgt_txt)
             tgt_item.setFlags(QtCore.Qt.ItemIsEditable | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
             self.tbl.setItem(row, self.COL_TARGET, tgt_item)
-            self._row_targets.append(tgt)  # NEW: remember which target belongs to this row
+            self._row_targets.append(tgt)  # remember which target belongs to this row
 
             # type (col 2)
             type_txt = "LINEAR" if expr.type == LinkType.LINEAR else "RELAX_EXP"
@@ -572,7 +570,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     # ---------------------------Slots---------------------------------------
     def _on_add_row(self):
         n, ok = QtWidgets.QInputDialog.getInt(
-        self, "Add Rows", "How many rows to add?", value=1, min=1, max=1000
+        self, "Add Rows", "How many rows to add?", value=1, min=1, max=50000
         )
         if not ok:
             return
@@ -605,7 +603,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     def _on_generate_targets(self):
         """
         Generate a block of targets from the currently selected target.
-        Now optionally: immediately apply an exponential template to JUST the generated rows.
+        Optionally: immediately apply an exponential template to JUST the generated rows.
         """
         cur_row = self.tbl.currentRow()
         if cur_row < 0:
@@ -960,7 +958,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         if it is not None:
             self._clear_error(it)
 
-        # we must also update link_store key; simplest is: remove old, add new
+        # update link_store key; simplest is: remove old, add new
         old_pref = self._row_targets[row]
 
         # if there was no old link (new/blank row), we may not have anything in store yet
@@ -970,7 +968,6 @@ class LinkManagerDialog(QtWidgets.QDialog):
             expr = None
 
         if expr is None:
-            # new row: create an empty expr here if you want, or just remember target
             self._row_targets[row] = new_pref
             return
 
@@ -1000,12 +997,10 @@ class LinkManagerDialog(QtWidgets.QDialog):
         self._refresh_row_from_expr(row, expr)
 
     def _apply_expr_from_cell(self, row: int, text: str) -> None:
-        # make sure we have a slot for this row
         self._ensure_row_targets_len(row)
 
         tgt = self._row_targets[row]
         if tgt is None:
-            # no target yet → we can’t interpret expr in a meaningful way
             return
 
         # read type + driver from the row
@@ -1036,7 +1031,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         # write back to store
         self._link_store.set_link(new_expr)
 
-        # update our row→target map (in case user typed a full lhs=... form later)
+        # update row→target map (in case user typed a full lhs=... form later)
         self._row_targets[row] = new_expr.target
 
         # finally refresh row (this will reformat nicely)
@@ -1050,13 +1045,12 @@ class LinkManagerDialog(QtWidgets.QDialog):
         if sel is None:
             return
 
-        # 1) collect rows that have THIS COLUMN selected
         target_rows: list[int] = []
         for idx in sel.selectedIndexes():
             if idx.column() == col:
                 target_rows.append(idx.row())
 
-        # 2) fallback: maybe user selected whole rows
+        # fallback: maybe user selected whole rows
         if not target_rows:
             for idx in sel.selectedRows():
                 target_rows.append(idx.row())
@@ -1064,7 +1058,6 @@ class LinkManagerDialog(QtWidgets.QDialog):
         if not target_rows:
             return
 
-        # 3) now we can safely loop
         for r in target_rows:
             if r == src_row:
                 continue
@@ -1101,9 +1094,6 @@ class LinkManagerDialog(QtWidgets.QDialog):
                 elif col == self.COL_EXPR:
                     self._apply_expr_from_cell(r, str(value))
 
-
-
-
     def _norm_type(self, txt: str) -> str:
         t = (txt or "").strip().lower()
         if t == "linear":
@@ -1119,7 +1109,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         """
         Single place to convert a 4-cell row into LinkExpr.
         We try in this order:
-        1) if expr_txt starts with '=' → inline form (your old _parse_expr)
+        1) if expr_txt starts with '=' → inline
         2) else if type is RELAX_EXP → parse KV style
         3) else → linear implicit
         """
@@ -1306,7 +1296,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
 
         # main should look like: -0.1/T_name   or  -0.1/0.035
         if not main.startswith("-"):
-            # we allow user mistakes but we *could* warn here
+            # allow user mistakes but give warning here
             main_k = main
         else:
             main_k = main[1:]
@@ -1324,7 +1314,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
             out["T"] = float(t_part)
         else:
             out["T_name"] = t_part
-        # we also keep k so evaluator knows rate = k / T
+        # keep k so evaluator knows rate = k / T
         out["t_override"] = k_val
         return out
 
@@ -1499,7 +1489,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         self.tbl.blockSignals(False)
 
     def _remove_table_row(self, row: int) -> None:
-        # drop from our parallel list first
+        
         if 0 <= row < len(self._row_targets):
             self._row_targets.pop(row)
 
@@ -1525,8 +1515,8 @@ class LinkManagerDialog(QtWidgets.QDialog):
     def _on_export_links(self):
         """
         Export what is CURRENTLY shown in the Link Manager table.
-        We don't go through LinkStore here on purpose: user might have just typed
-        in the Expr cell and not pressed Enter/save yet – we want that too.
+        Don't go through LinkStore here on purpose: user might have just typed
+        in the Expr cell and not pressed Enter/save yet.
         Format: similar headers to peak_table_io_v3, then a tab-separated table.
         """
         parent = self.parent()
@@ -1542,7 +1532,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         if not path:
             return
 
-        # --- collect rows first so we can count enabled ---
+        # --- collect rows first
         rows = []
         enabled_count = 0
         rc = self.tbl.rowCount()
@@ -2747,7 +2737,7 @@ def _seed_external_drivers_into_registry(
             registry[d] = {"value": val, "fixed": True, "bounds": (val, val)}
 
     if strict and missing:
-        # Build a human-friendly message
+
         lines = []
         for d, why in missing:
             lines.append(f"- driver slice={d.slice_id} peak={d.peak_id} name={getattr(d, 'name', '?')}: {why}")
@@ -3078,7 +3068,7 @@ def global_ref(sid: int, name: str) -> "ParamRef":
     return ParamRef(slice_id=int(sid), peak_id=000, name=str(name))
 
 def canon_name(n: str) -> str:
-    """Keep this small. Best is: LinkManager only ever stores canonical names."""
+
     n = (n or "").strip().lower()
     # allow backwards-compat / synonyms
     return {
@@ -3140,7 +3130,7 @@ class FitContext:
 
 
 
-    def residual(self, params: Parameters, peaks_shape: List[Peak], sid) -> np.ndarray:
+    def residual(self, params: Parameters, no_of_peaks, sid) -> np.ndarray:
         """
         peaks_shape is to get the number of peaks to build an updated peaks List during optimization
         no actual value of peak_shape is read.
@@ -3158,7 +3148,7 @@ class FitContext:
 
         # --- rebuild peaks from params (in Hz) ---
         peaks: List[Peak] = []
-        for i in range(len(peaks_shape)):
+        for i in range(no_of_peaks):
             peaks.append(Peak(
                 pos=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, #Hz
                 amp=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value,
@@ -5151,7 +5141,7 @@ class  MainWindow(QMainWindow):
             self.slice_states.clear()          
             
             if p.suffix.lower() == ".json":
-                # Use your ssNake-aware loader
+                # Use ssNake-aware loader
                 x_ppm, x_hz_raw, y_traces, meta = load_ssnake(p)
                 
                 # --- try to read SW from meta, else leave None (auto-estimate)
@@ -5234,7 +5224,7 @@ class  MainWindow(QMainWindow):
                 self.display_slice(0, preserve_view=False)
 
             else:
-                # fallback: 2-column text loader already in your file
+                # fallback: 2-column text loader
                 x, y = load_spectrum(path)
                 self.x, self.y = x.astype(float), y.astype(float)
 
@@ -5591,6 +5581,7 @@ class  MainWindow(QMainWindow):
             # 1) Read peaks/fix from the Model (no table pokes)
             peaks, fix_flags, _ = self.peak_model.return_model()
             sid = int(getattr(self, "slice_index", 0))
+            no_of_peaks = self._peaks_per_slice(int(getattr(self, "slice_index", 0)))
 
             # 2) Read other settings from the UI
             self.current_settings()
@@ -5657,13 +5648,13 @@ class  MainWindow(QMainWindow):
 
             try:
                 result = minimize(
-                    lambda p: ctx.residual(p, peaks, sid),
+                    lambda p: ctx.residual(p, no_of_peaks, sid),
                     params,
                     method='least_squares', max_nfev=5000,
                     ftol=1e-8, xtol=1e-8, gtol=1e-8, x_scale='jac', loss='soft_l1'
                 )
 
-                self.fit_stats = extract_FitResult_and_corr(result)
+                self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Single Fit", slice_indices_list=[sid])
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, 'Fit error', str(e))
                 return  # finally{} will end_busy()
@@ -5750,7 +5741,7 @@ class  MainWindow(QMainWindow):
                 
 
     def on_fit_pick_and_run(self) -> None:
-        """Dialog → run sequential or joint worker."""
+        """Dialog → run sequential or joint."""
         data2d = getattr(self, "data2d", None)
         if not (hasattr(data2d, "shape") and data2d.ndim == 2 and data2d.shape[0] > 1):
             QtWidgets.QMessageBox.information(self, "Fit Selected…", "No 2D data with multiple slices.")
@@ -5820,7 +5811,7 @@ class  MainWindow(QMainWindow):
                         self.peak_model.bind_state(st)
                 if not self._bind_slice_direct(k):
                     continue
-                self.on_slice_spin_changed(k)  # if your UI expects it
+                self.on_slice_spin_changed(k)
                 self.on_fit_current(allow_external_drivers=True, status=False)
                 fitted.append(k)
         finally:
@@ -5884,7 +5875,7 @@ class  MainWindow(QMainWindow):
                 method='least_squares', max_nfev=5000,
                 ftol=1e-8, xtol=1e-8, gtol=1e-8, loss='soft_l1', x_scale='jac'                
             )
-            self.fit_stats = extract_FitResult_and_corr(result)
+            self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Joint Fit", slice_indices_list=indices)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, 'Joint Fit error', str(e))
             try: self._end_busy()
@@ -5894,9 +5885,9 @@ class  MainWindow(QMainWindow):
         # Scatter back per slice; refresh caches/UI
         for sid, ctx, tmpl, fix_flags, pre in slice_ctxs:
             ctx.result_to_peaks(tmpl, result.params, prefix=pre)
-            mult_val  = result.params[f'{pre}mult'].value
-            off_val   = result.params[f'{pre}offset'].value
-            phi0_val  = result.params[f'{pre}phi0_deg'].value
+            mult_val  = result.params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].value
+            off_val   = result.params[f'{ParamRef_to_key(global_ref(sid, "offset"))}'].value
+            phi0_val  = result.params[f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}'].value
 
             st = self.slice_states.get(sid) or SliceFitState()
             self.slice_states[sid] = st
@@ -7087,8 +7078,7 @@ class  MainWindow(QMainWindow):
     def ready_for_sim(self) -> bool:
         # Simulate preview typically needs peaks
         return self.ready_for_fit() and self.has_peaks()
-    
-    # --- 2.2 UI wiring and visual feedback ---
+
     def _mark_invalid(self, lineedit, invalid: bool):
         if lineedit is None:
             return
@@ -7184,7 +7174,7 @@ class  MainWindow(QMainWindow):
 class SlicePickerDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, N: int, labels: list[str], prechecked: list[int]):
         super().__init__(parent)
-        self._parent = parent  # NEW: keep parent to call workers
+        self._parent = parent  
         self.setWindowTitle("Select Slices")
         self.setModal(True)
         self.resize(420, 520)

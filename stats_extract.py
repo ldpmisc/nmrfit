@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import math
+import json
+from pathlib import Path
+from wsgiref import headers
 import numpy as np
 
 @dataclass(frozen=True) #prevent modification
@@ -83,7 +86,7 @@ def extract_FitResult(
                 min=(None if getattr(p, "min", None) is None else float(p.min)),
                 max=(None if getattr(p, "max", None) is None else float(p.max)),
                 expr=(None if not expr else str(expr)),
-                init_values=(None if getattr(p, "init_values", None) is None else float(p.init_values)),
+                init_values=(None if getattr(p, "init_values", None) is None else p.init_values[0]),
             )
         )
 
@@ -97,34 +100,6 @@ def extract_FitResult(
         raise ValueError(f"Unknown sort_by={sort_by!r}")
 
     return rows
-
-def stats_summary(result: Any, mode, slice_indices):
-    summary = []
-    add = summary.append
-    chisqr = getattr(result, "chisqr", None)
-    redchi = getattr(result,"redchi", None)
-    aic = getattr(result,"aic", None)
-    bic = getattr(result,"bic", None)
-    nfev = getattr(result,"nfev", None)
-    nvarys = getattr(result,"nvarys", None)
-    nfree = getattr(result, "nfree", None)
-    method = getattr(result, "method", None)
-    data_points = getattr(result, 'ndata', None)
-    
-    add(f"Mode = {mode}")
-    add(f"Slices = {slice_indices}")
-    add(f"chi-square = {chisqr}")
-    add(f"reduced chi-square = {redchi}")
-    add(f"Akaike info crit = {aic}")
-    add(f"Bayesian info crit = {bic}")
-    add(f"function evals = {nfev}")
-    add(f"number of free variables = {nvarys}")
-    add(f"degree of freedoms = {nfree}")
-    add(f"fitting method = {method}")
-    add(f"data points = {data_points}")
-    return summary
-
-
 
 def extract_correlation_info(
     result: Any,
@@ -201,9 +176,36 @@ def extract_correlation_info(
         note=note,
     )
 
+def stats_summary(result: Any, mode, slice_indices_list: List[int]) -> Dict: #result: lmfit.MinimizerResult object
+    summary = {}
+    chisqr = getattr(result, "chisqr", None)
+    redchi = getattr(result,"redchi", None)
+    aic = getattr(result,"aic", None)
+    bic = getattr(result,"bic", None)
+    nfev = getattr(result,"nfev", None)
+    nvarys = getattr(result,"nvarys", None)
+    nfree = getattr(result, "nfree", None)
+    method = getattr(result, "method", None)
+    data_points = getattr(result, 'ndata', None)
+    
+    summary["Mode"] = mode
+    summary["Slices"] = slice_indices_list
+    summary["Fitting method"] = method
+    summary["Degree of freedoms"] = int(nfree)
+    summary["Data points"] = int(data_points)
+    summary["Number of free variables"] = int(nvarys)
+    summary["Function evals"] = int(nfev)
+    summary["chi-square"] = float(chisqr)
+    summary["reduced chi-square"] = float(redchi)
+    summary["Akaike info crit"] = float(aic)
+    summary["Bayesian info crit"] = float(bic)
+    
+    return summary
 
-def extract_FitResult_and_corr(
+def extract_FitResult_corr_and_sum(
     result: Any,
+    mode: str,
+    slice_indices_list: List[int],
     *,
     include_fixed: bool = True,
     include_expr: bool = True,
@@ -234,11 +236,183 @@ def extract_FitResult_and_corr(
         matrix = corr_info.corr_mat.tolist()
 
     return {
+        "summary": stats_summary(result, mode=mode, slice_indices_list=slice_indices_list),
         "params": [r.__dict__ for r in param_rows],
         "corr": {
             "names": list(corr_info.names),
             "note": corr_info.note,
             "pairs": [p.__dict__ for p in corr_info.pairs],
             "matrix": matrix,
-        },
+        },        
     }
+
+def _export_stats_payload(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize and ensure JSON-serializable structure.
+    Expected stats from extract_FitResult_corr_and_sum():
+      {
+        "params": [ { ... init_values ... }, ... ],
+        "corr": { "pairs": [...], "names": [...], "note": str, "matrix": list|None },
+        "summary": { "Mode": ..., "Slices": ..., ... }
+      }
+    """
+    out = dict(stats or {})
+    out.setdefault("summary", {})
+    out.setdefault("params", [])
+    out.setdefault("corr", {})
+
+    if not isinstance(out["summary"], dict):
+        out["summary"] = {}
+    if not isinstance(out["corr"], dict):
+        out["corr"] = {}
+
+    out["corr"].setdefault("pairs", [])
+    out["corr"].setdefault("names", [])
+    out["corr"].setdefault("note", "")
+    out["corr"].setdefault("matrix", None)
+
+    return out
+
+
+def save_stats_json(path: str, stats: Dict[str, Any], *, indent: int = 2) -> str:
+    payload = _export_stats_payload(stats)
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=indent, ensure_ascii=False)
+    return str(p)
+
+
+#def save_params_txt(path: str, stats: Dict[str, Any]) -> str:
+#    payload = _export_stats_payload(stats)
+#    rows = payload.get("params", []) or []
+#
+#    p = Path(path).expanduser().resolve()
+#    p.parent.mkdir(parents=True, exist_ok=True)
+#
+#    headers = ["name", "value", "stderr", "spercent", "vary", "min", "max", "expr", "init_values"]
+#
+#    with p.open("w", encoding="utf-8") as f:
+#        f.write("\t".join(headers) + "\n")
+#        for r in rows:
+#
+#            r = r if isinstance(r, dict) else {}
+#            line = []
+#            for h in headers:
+#                v = r.get(h, "")
+#                line.append("" if v is None else str(v))
+#            f.write("\t".join(line) + "\n")
+#
+#    return str(p)
+#
+#
+#def save_corr_pairs_txt(path: str, stats: Dict[str, Any]) -> str:
+#    payload = _export_stats_payload(stats)
+#    corr = payload.get("corr", {}) or {}
+#    pairs = corr.get("pairs", []) or []
+#
+#    p = Path(path).expanduser().resolve()
+#    p.parent.mkdir(parents=True, exist_ok=True)
+#
+#    headers = ["name_i", "name_j", "r", "abs_r", "i", "j"]
+#
+#    with p.open("w", encoding="utf-8") as f:
+#        f.write("\t".join(headers) + "\n")
+#        for r in pairs:
+#            r = r if isinstance(r, dict) else {}
+#            line = []
+#            for h in headers:
+#                v = r.get(h, "")
+#                line.append("" if v is None else str(v))
+#            f.write("\t".join(line) + "\n")
+#
+#    return str(p)
+
+def save_fit_report_txt(path: str, stats: Dict[str, Any]) -> str:
+    payload = _export_stats_payload(stats)
+
+    summary = payload.get("summary", {}) or {}
+    rows = payload.get("params", []) or []
+    corr = payload.get("corr", {}) or {}
+    pairs = corr.get("pairs", []) or []
+    note = corr.get("note", "") or ""
+
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    # Column order (match your data keys)
+    param_headers = ["name", "value", "stderr", "spercent", "vary", "min", "max", "expr", "init_values"]
+    corr_headers = ["name_i", "name_j", "r", "abs_r", "i", "j"]
+
+    def _fmt(v):
+        if v is None:
+            return "—"
+        return str(v)
+
+    with p.open("w", encoding="utf-8") as f:
+        # ========= Summary =========
+        f.write("=== Fit Summary ===\n")
+        # If you want a stable order, define it; otherwise, summary dict insertion order is used.
+        preferred = [
+            "Mode", "Slices",
+            "chi-square", "reduced chi-square",
+            "Data points", "Number of free variables", "Degree of freedoms",
+            "Fitting method", "Function evals",
+            "Akaike info crit", "Bayesian info crit",
+        ]
+        for k in preferred:
+            if k in summary:
+                f.write(f"{k}: {_fmt(summary.get(k))}\n")
+        # Write any extra keys not in preferred
+        for k, v in summary.items():
+            if k not in preferred:
+                f.write(f"{k}: {_fmt(v)}\n")
+
+        f.write("\n")
+
+        # ========= Parameters =========
+        f.write("=== Parameters ===\n")
+        f.write("\t".join(param_headers) + "\n")
+        for r in rows:
+            r = r if isinstance(r, dict) else {}
+            line = []
+            for h in param_headers:
+                v = r.get(h, "")
+                line.append("" if v is None else str(v))
+            f.write("\t".join(line) + "\n")
+
+        f.write("\n")
+
+        # ========= Correlations =========
+        f.write("=== Correlations (pairs) ===\n")
+        if note:
+            f.write(f"Note: {note}\n")
+        f.write("\t".join(corr_headers) + "\n")
+        for r in pairs:
+            r = r if isinstance(r, dict) else {}
+            line = []
+            for h in corr_headers:
+                v = r.get(h, "")
+                line.append("" if v is None else str(v))
+            f.write("\t".join(line) + "\n")
+
+    return str(p)
+
+def save_stats_bundle(base_path: str, stats: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Write:
+      <name>.json
+      <name>_report.txt
+    """
+    base = Path(base_path).expanduser().resolve()
+
+    # user may pick .json or .txt; normalize to a stem
+    if base.suffix.lower() in (".json", ".txt"):
+        stem = base.with_suffix("")
+    else:
+        stem = base
+
+    written = {}
+    written["json"] = save_stats_json(str(stem) + ".json", stats)
+    written["report_txt"] = save_fit_report_txt(str(stem) + "_report.txt", stats)
+    return written
