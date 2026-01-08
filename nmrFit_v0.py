@@ -97,16 +97,16 @@ from stats_extract import extract_FitResult_corr_and_sum
 from stats_view import StatsView
 from constraint_rules import (
     ParamRef,
+    ConstraintType,
     ConstraintRule,
     LinearConstraint,
     RelaxDecayConstraint,
-    ConstraintRuleFactory,
     LinkExpr_to_ConstraintRule,
     ConstraintRule_to_LinkExpr,
-    ConstrainedPeak,
     ConstraintStore,
     ConstraintValidationError,
     FitOrchestrator,
+    fmt_pref, txt_to_pref, row_to_rule, resolve_constraint_type, pref_equal
 )
 
 import os
@@ -185,7 +185,9 @@ class SliceFitState:
     redchi: Optional[float] = None
     state_stats = None
 
-
+class LinkType(Enum):
+    LINEAR = auto()       # target = a * driver + b
+    RELAX_EXP = auto()    # target(i) = driver * A * exp(-t_i / T) + C
 
 
 @dataclass
@@ -319,9 +321,10 @@ class LinkManagerDialog(QtWidgets.QDialog):
             "s15_p1_amp<br>"
             "2*s15_p1_amp<br>"
             "s15_p1_amp + 1<br>"
-            "2*s15_p1_amp - 0.5<br>"
-            "a=0.95, b=0.02, driver=s15_p1_amp<br>"
+            "2*s15_p1_amp - 0.5<br>"            
             "s14_p2_amp = 2*s15_p1_amp + 1"
+            "Do not support:<br>"
+            "2s15_p1_amp + 1 (missing * between number and paramRef)"
         )
 
         exp_lbl = make_label(
@@ -387,220 +390,138 @@ class LinkManagerDialog(QtWidgets.QDialog):
         t = (t or "").strip().upper()
         return t if t in ("LINEAR", "RELAX_EXP") else "LINEAR"
 
-    def _fmt_pref_safe(self, pref) -> str:
-        try:
-            return ConstraintRuleFactory._fmt_pref(pref)
-        except Exception:
-            # fallback
-            try:
-                return f"s{pref.slice_id}_p{pref.peak_id}_{pref.name}"
-            except Exception:
-                return ""
-
     def _target_pref_from_row(self, row: int):
         self._ensure_row_targets_len(row)
-        return self._row_targets[row]    
-        def _ensure_row_targets_len(self, upto_row: int) -> None:
+        return self._row_targets[row] 
+       
+    def _ensure_row_targets_len(self, upto_row: int) -> None:
         # make sure _row_targets has at least (upto_row + 1) elements
             while len(self._row_targets) <= upto_row:
                 self._row_targets.append(None)
 
-    def _driver_pref_from_cell(self, row: int) -> ParamRef | None:
-        it = self.tbl.item(row, self.COL_DRIVER)
+    def _enabled_from_cell(self, row: int) -> bool:
+        it = self.tbl.item(row, self.COL_ENABLED)
         if it is None:
-            return None
-        txt = (it.text() or "").strip()
-        if not txt or txt.lower() == "(none)":
-            return None
-        try:
-            return ConstraintRuleFactory.parse_pref(txt)
-        except Exception:
-            return None
+            return True
+        return it.checkState() == QtCore.Qt.Checked
 
+    def _get_item_text(self, row: int, col: int) -> str:
+        """Get text from table cell at (row, col). Returns empty string if item is None."""
+        it = self.tbl.item(row, col)
+        if it is None:
+            return ""
+        return (it.text() or "").strip()
 
-    def _reload(self):
-        self.tbl.blockSignals(True)
-        self.tbl.setRowCount(0)
-        self._row_targets.clear()   # keep “row → ParamRef” mapping
-        # Collect all constraints/links from both stores
-        exprs_to_display = []
-        
-        # First, gather from ConstraintStore if available
-        if self._constraint_store is not None:
-            try:
-                for target_pref, rule in self._constraint_store.all_constraints():
-                    try:
-                        # Convert ConstraintRule back to LinkExpr for display
-                        expr = ConstraintRule_to_LinkExpr(rule)
-                        exprs_to_display.append(expr)
-                    except Exception:
-                        # If conversion fails, skip this rule
-                        pass
-            except Exception:
-                pass
-        
-        # Then gather from LinkStore (either as fallback or alongside ConstraintStore)
-        for expr in self._link_store.all_expr():
-            # Skip duplicates if already in ConstraintStore
-            if self._constraint_store is not None:
-                try:
-                    existing_rule = self._constraint_store.get_constraint(expr.target)
-                    if existing_rule is not None:
-                        # Already displayed from ConstraintStore
-                        continue
-                except Exception:
-                    pass
-            exprs_to_display.append(expr)
-        
-        # Display all collected expressions
-        for expr in exprs_to_display:
-            row = self.tbl.rowCount()
-            self.tbl.insertRow(row)
-            # enabled (col 0)
-            en_item = QtWidgets.QTableWidgetItem()
-            en_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
-            en_item.setCheckState(QtCore.Qt.Checked if getattr(expr, "enabled", True) else QtCore.Qt.Unchecked)
-            en_item.setText("") 
-            self.tbl.setItem(row, 0, en_item)
-
-            # target (col 1)
-            tgt = expr.target
-            tgt_txt = ConstraintRuleFactory._fmt_pref(tgt)
-            # CHANGED: make item directly + make editable
-            tgt_item = QtWidgets.QTableWidgetItem(tgt_txt)
-            tgt_item.setFlags(QtCore.Qt.ItemIsEditable | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
-            self.tbl.setItem(row, self.COL_TARGET, tgt_item)
-            self._row_targets.append(tgt)  # remember which target belongs to this row
-
-            # type (col 2)
-            # Infer type from constraint: try to convert back to rule to check type
-            try:
-                rule = LinkExpr_to_ConstraintRule(expr)
-                type_txt = "LINEAR" if isinstance(rule, LinearConstraint) else "RELAX_EXP"
-            except Exception:
-                type_txt = "LINEAR"
-            type_item = QtWidgets.QTableWidgetItem(type_txt)
-            self.tbl.setItem(row, 2, type_item)
-
-            # driver
-            if expr.driver is not None:
-                drv_txt = ConstraintRuleFactory._fmt_pref(expr.driver)
-            else:
-                drv_txt = "(none)"
-            drv_item = QtWidgets.QTableWidgetItem(drv_txt)
-
-            self.tbl.setItem(row, 3, drv_item)
-
-            # Expr (editable)
-            try:
-                rule = LinkExpr_to_ConstraintRule(expr)
-                is_linear = isinstance(rule, LinearConstraint)
-            except Exception:
-                is_linear = True
-            
-            if is_linear:
-                if expr.driver is not None:
-                    expr_txt = ConstraintRuleFactory._fmt_linear_args(args=expr.args, driver=expr.driver)
-                else:
-                    a = expr.args.get("a", 1.0)
-                    b = expr.args.get("b", 0.0)
-                    expr_txt = f"a={a}, b={b}"
-            
-            else:  # RELAX_EXP
-                if expr.driver is not None:
-                    expr_txt = ConstraintRuleFactory._fmt_exp_args(args=expr.args, driver=expr.driver)
-                else:
-                    A = expr.args.get("A", 1.0)
-                    C = expr.args.get("C", 0.0)
-                    Tn = expr.args.get("T_name")
-                    T = expr.args.get("T")
-                    k = expr.args.get("t_override", 1)
-                    # fallback display for driverless exp (rare)
-                    if Tn is not None:
-                        expr_txt = f"exp(-{k:g}/{Tn}+{C:g})"
-                    else:
-                        expr_txt = f"exp(-{k:g}/{T:g}+{C:g})"
-            expr_item = QtWidgets.QTableWidgetItem(expr_txt)
-            # NEW: make expr editable (for drag-fill too)
-            expr_item.setFlags(QtCore.Qt.ItemIsEditable | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
-            self.tbl.setItem(row, self.COL_EXPR, expr_item)
-
-            self.tbl.setRowHeight(row, 22)
-        self.tbl.blockSignals(False)
-    
-    def _refresh_row_from_expr(self, row: int, expr: LinkExpr) -> None:
+    def _reload(self) -> None:
         """
-        Avoids full _reload() inside itemChanged.
+        Reload table rows from ConstraintStore only.
+        No LinkStore, no LinkExpr, no conversions.
+        """
+        self.tbl.blockSignals(True)
+        try:
+            self.tbl.setRowCount(0)
+            self._row_targets.clear()   # row -> ParamRef mapping
+
+            if self._constraint_store is None:
+                return
+
+            # Iterate through constraints in store
+            for target_pref, rule in self._constraint_store.all_constraints():
+                # If you store "None" to mean "no constraint", skip here
+                if rule is None:
+                    continue
+
+                row = self.tbl.rowCount()
+                self.tbl.insertRow(row)
+
+                # --- Enabled (col 0) ---
+                enabled = bool(getattr(rule, "enabled", True))
+                en_item = QtWidgets.QTableWidgetItem()
+                en_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+                en_item.setCheckState(QtCore.Qt.Checked if enabled else QtCore.Qt.Unchecked)
+                en_item.setText("")
+                self.tbl.setItem(row, self.COL_ENABLED, en_item)
+
+                # --- Target (editable) ---
+                tgt_txt = fmt_pref(target_pref)
+                tgt_item = QtWidgets.QTableWidgetItem(tgt_txt)
+                tgt_item.setFlags(QtCore.Qt.ItemIsEditable | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                self.tbl.setItem(row, self.COL_TARGET, tgt_item)
+                self._row_targets.append(target_pref)
+
+                # --- Type ---
+                ct = getattr(rule, "constraint_type", None)
+                if isinstance(ct, ConstraintType):
+                    type_txt = ct.value
+                else:
+                    type_txt = "LINEAR"
+                type_item = QtWidgets.QTableWidgetItem(type_txt)
+                self.tbl.setItem(row, self.COL_TYPE, type_item)
+
+                # --- Driver ---
+                drv = getattr(rule, "driver_pref", None)
+                drv_txt = fmt_pref(drv) if drv is not None else "(none)"
+                drv_item = QtWidgets.QTableWidgetItem(drv_txt)
+                self.tbl.setItem(row, self.COL_DRIVER, drv_item)
+
+                # --- Expr (editable) ---
+                expr_txt = (getattr(rule, "expr_txt", "") or "").strip()
+                expr_item = QtWidgets.QTableWidgetItem(expr_txt)
+                expr_item.setFlags(QtCore.Qt.ItemIsEditable | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                self.tbl.setItem(row, self.COL_EXPR, expr_item)
+
+                self.tbl.setRowHeight(row, 22)
+
+        finally:
+            self.tbl.blockSignals(False)
+    
+    def _refresh_row_from_rule(self, row: int, rule: ConstraintRule) -> None:
+        """
+        Reload table row from ConstraintRule instance.
+        No LinkStore, no LinkExpr, no conversions, no inline parsing.
         Keep ALL cells editable.
         """
         self.tbl.blockSignals(True)
-        # 0) enabled checkbox
-        en_item = self.tbl.item(row, self.COL_ENABLED)
-
-        if en_item is None:
-            en_item = QtWidgets.QTableWidgetItem()
-            en_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
-            self.tbl.setItem(row, 0, en_item)
-        en_item.setCheckState(QtCore.Qt.Checked if getattr(expr, "enabled", True) else QtCore.Qt.Unchecked)
-        en_item.setText("") 
-
-        # 1) type
         try:
-            rule = LinkExpr_to_ConstraintRule(expr)
-            type_txt = "LINEAR" if isinstance(rule, LinearConstraint) else "RELAX_EXP"
-        except Exception:
-            type_txt = "LINEAR"
-        type_item = self.tbl.item(row, self.COL_TYPE)
-        if type_item is None:
-            type_item = QtWidgets.QTableWidgetItem()
-            self.tbl.setItem(row, 2, type_item)
-        type_item.setText(type_txt)
+            # 0) enabled checkbox
+            en_item = self.tbl.item(row, self.COL_ENABLED)
+            if en_item is None:
+                en_item = QtWidgets.QTableWidgetItem()
+                en_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+                self.tbl.setItem(row, self.COL_ENABLED, en_item)
+            en_item.setCheckState(QtCore.Qt.Checked if rule.enabled else QtCore.Qt.Unchecked)
+            en_item.setText("")
 
-        # 2) driver
-        drv_item = self.tbl.item(row, self.COL_DRIVER)
-        if drv_item is None:
-            drv_item = QtWidgets.QTableWidgetItem()
-            self.tbl.setItem(row, 3, drv_item)
-        if expr.driver is not None:
-            drv_item.setText(ConstraintRuleFactory._fmt_pref(expr.driver))
-        else:
-            drv_item.setText("(none)")
+            # 1) type - use constraint_type property
+            type_txt = rule.constraint_type.value          
+            type_item = self.tbl.item(row, self.COL_TYPE)
+            if type_item is None:
+                type_item = QtWidgets.QTableWidgetItem()
+                self.tbl.setItem(row, self.COL_TYPE, type_item)
+            type_item.setText(type_txt)
 
-        # 3) expr cell
-        expr_item = self.tbl.item(row, self.COL_EXPR)
-        if expr_item is None:
-            expr_item = QtWidgets.QTableWidgetItem()
-            self.tbl.setItem(row, 4, expr_item)
-        try:
-            rule = LinkExpr_to_ConstraintRule(expr)
-            is_linear = isinstance(rule, LinearConstraint)
-        except Exception:
-            is_linear = True
-        
-        if is_linear:
-            if expr.driver is not None:
-                expr_txt = ConstraintRuleFactory._fmt_linear_args(args=expr.args, driver=expr.driver)
+            # 2) driver - use driver_pref attribute + fmt_pref parser
+            drv_item = self.tbl.item(row, self.COL_DRIVER)
+            if drv_item is None:
+                drv_item = QtWidgets.QTableWidgetItem()
+                self.tbl.setItem(row, self.COL_DRIVER, drv_item)
+            
+            if rule.driver_pref is not None:
+                drv_item.setText(fmt_pref(rule.driver_pref))
             else:
-                a = expr.args.get("a", 1.0)
-                b = expr.args.get("b", 0.0)
-                expr_txt = f"a={a:g}, b={b:g}"
-        else:  # RELAX_EXP
-            if expr.driver is not None:
-                expr_txt = ConstraintRuleFactory._fmt_exp_args(args=expr.args, driver=expr.driver)
-            else:
-                A = expr.args.get("A", 1.0)
-                C = expr.args.get("C", 0.0)
-                Tn = expr.args.get("T_name")
-                T = expr.args.get("T")
-                k = expr.args.get("t_override", 1)
-                if Tn is not None:
-                    expr_txt = f"exp(-{k:g}/{Tn}+{C:g})"
-                else:
-                    expr_txt = f"exp(-{k:g}/{T:g}+{C:g})"
+                drv_item.setText("(none)")
 
-        expr_item.setText(expr_txt)
+            # 3) expr cell
+            expr_item = self.tbl.item(row, self.COL_EXPR)
+            if expr_item is None:
+                expr_item = QtWidgets.QTableWidgetItem()
+                self.tbl.setItem(row, self.COL_EXPR, expr_item)
 
-        self.tbl.blockSignals(False)
+            expr_txt = rule.rule_to_expr()            
+            expr_item.setText(expr_txt)
+
+        finally:
+            self.tbl.blockSignals(False)
     
     def _mark_error(self, item: QtWidgets.QTableWidgetItem, msg: str):
         # IMPORTANT: don’t let these UI changes trigger itemChanged again
@@ -669,7 +590,9 @@ class LinkManagerDialog(QtWidgets.QDialog):
         # --------------------- generate targets ---------------------
     def _on_generate_targets(self):
         """
-        Generate a block of targets from the currently selected target.
+        Generate a block of targets text from the currently selected target.
+        UI-only text handling: populate cells with text, then call _try_commit_row
+        to parse and write to constraint_store.
         Optionally: immediately apply an exponential template to JUST the generated rows.
         """
         cur_row = self.tbl.currentRow()
@@ -683,15 +606,16 @@ class LinkManagerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Generate targets", "The selected row has no target.")
             return
     
+        # Parse source text to extract slice_id, peak_id, name
         try:
-            src_pref = self._parse_pref(src_txt)
+            src_pref = txt_to_pref(src_txt)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Generate targets", f"Invalid source target: {e}")
             return
     
         dlg = _GenerateTargetsDialog(
             parent=self,
-            source_text=ConstraintRuleFactory._fmt_pref(src_pref),
+            source_text=fmt_pref(src_pref),
             max_slices=int(self._slice_count),
             max_peaks=int(self._peaks_per_slice),
             start_row=cur_row + 1,
@@ -708,25 +632,25 @@ class LinkManagerDialog(QtWidgets.QDialog):
         overwrite   = opts["overwrite"]         # bool
         make_exp    = opts.get("make_exp", False)
     
-        # --------- build list of ParamRef ----------
-        targets: list[ParamRef] = []
+        # --------- build list of target TEXT strings ----------
+        target_texts: list[str] = []
         if mode == "peak":
             for pid in range(opts["peak_from"], opts["peak_to"] + 1):
-                tgt = ParamRef(slice_id=src_pref.slice_id, peak_id=pid, name=src_pref.name)
-                targets.append(tgt)
+                target_txt = f"s{src_pref.slice_id}_p{pid}_{src_pref.name}"
+                target_texts.append(target_txt)
         else:  # "slice"
             for sid in range(opts["slice_from"], opts["slice_to"] + 1):
-                tgt = ParamRef(slice_id=sid, peak_id=src_pref.peak_id, name=src_pref.name)
-                targets.append(tgt)
+                target_txt = f"s{sid}_p{src_pref.peak_id}_{src_pref.name}"
+                target_texts.append(target_txt)
     
-        if not targets:
+        if not target_texts:
             return
     
         self.tbl.blockSignals(True)
         row = start_row
         newly_created_rows: list[int] = []
     
-        for pref in targets:
+        for target_txt in target_texts:
             if row >= self.tbl.rowCount():
                 self.tbl.insertRow(row)
     
@@ -750,16 +674,12 @@ class LinkManagerDialog(QtWidgets.QDialog):
             en_item.setCheckState(QtCore.Qt.Checked)
             en_item.setText("")
     
-            # target
+            # target (TEXT only)
             if tgt_item is None:
                 tgt_item = QtWidgets.QTableWidgetItem()
                 tgt_item.setFlags(QtCore.Qt.ItemIsEditable | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
                 self.tbl.setItem(row, self.COL_TARGET, tgt_item)
-            tgt_item.setText(ConstraintRuleFactory._fmt_pref(pref))
-    
-            # remember
-            self._ensure_row_targets_len(row)
-            self._row_targets[row] = pref
+            tgt_item.setText(target_txt)
     
             # type = LINEAR (we may overwrite to RELAX_EXP later)
             type_item = self.tbl.item(row, self.COL_TYPE)
@@ -789,6 +709,12 @@ class LinkManagerDialog(QtWidgets.QDialog):
             row += 1
     
         self.tbl.blockSignals(False)
+        
+        # --------- commit rows to constraint_store ----------
+        # Now that UI is populated with text, parse and commit each row
+        for r in newly_created_rows:
+            self._apply_target_from_cell(r)
+            self._try_commit_row(r)
 
         # -------- optional exponential pass --------
         if make_exp and newly_created_rows:
@@ -935,85 +861,77 @@ class LinkManagerDialog(QtWidgets.QDialog):
         row = item.row()
         col = item.column()
         self._ensure_row_targets_len(row)
+
         try:
-            # figure out which change happened and update the source row first
+            # Commit the source row first
+            # (Note: _commit_row gracefully returns early if no target yet;
+            #  UI changes are preserved and will commit once target is filled)
             if col == self.COL_ENABLED:
-                self._apply_enabled_from_cell(row)
-                value_for_others = self.tbl.item(row, col).checkState()
-                self._propagate_to_selected_rows(src_row=row, col=col, value=value_for_others)
-          
-
-            if col == self.COL_TARGET:
-
+                self._try_commit_row(row)
+            elif col == self.COL_TARGET:
                 self._apply_target_from_cell(row, item.text())
-                self._propagate_to_selected_rows(src_row=row, col=col, value=item.text())
-              
+                self._try_commit_row(row)
+            elif col in (self.COL_TYPE, self.COL_DRIVER, self.COL_EXPR):
+                self._try_commit_row(row)
 
-            if col == self.COL_TYPE:
-                self._apply_type_from_cell(row, item.text())
-                self._propagate_to_selected_rows(src_row=row, col=col, value=item.text())
-             
+            # Then propagate to other selected rows in this column
+            sel = self.tbl.selectionModel()
+            if sel is None:
+                return
 
-            if col == self.COL_DRIVER:
+            # Collect all selected rows that have this column selected
+            selected_rows = set()
+            for idx in sel.selectedIndexes():
+                if idx.column() == col:
+                    selected_rows.add(idx.row())
 
-                self._apply_driver_from_cell(row, item.text())
-                self._propagate_to_selected_rows(src_row=row, col=col, value=item.text())
+            # Fallback: if no column-specific selection, check for whole-row selection
+            if not selected_rows:
+                for idx in sel.selectedRows():
+                    selected_rows.add(idx.row())
+
+            # Remove the source row (already committed above)
+            selected_rows.discard(row)
+
+            if not selected_rows:
+                return
+
+            # Propagate based on column type
+            if col == self.COL_ENABLED:
+                checked = item.checkState() == QtCore.Qt.Checked
+                for r in selected_rows:
+                    self._ensure_row_targets_len(r)
+                    # Only propagate to rows with valid targets
+                    if self._row_targets[r] is None:
+                        continue
+                    it = self.tbl.item(r, col)
+                    if it is not None:
+                        self.tbl.blockSignals(True)
+                        it.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+                        self.tbl.blockSignals(False)
+                        self._try_commit_row(r)
+
+            elif col == self.COL_TARGET:
+                value = item.text()
+                for r in selected_rows:
+                    self._ensure_row_targets_len(r)
+                    # text + mapping update
+                    self._set_cell_text_blocked(r, col, value)
+                    #block signal so that mid-edting change does not call commit_rule and parse incomplete text
+                    self._apply_target_from_cell(r, value)
+
+            elif col in (self.COL_TYPE, self.COL_DRIVER, self.COL_EXPR):
+                value = item.text()
+                for r in selected_rows:
+                    self._ensure_row_targets_len(r)
+                    self._set_cell_text_blocked(r, col, value)
+                    # commit only if row is committable; otherwise mark/keep pending
+                    self._try_commit_row(r)           
+
+
+        except Exception as ex:
+            log.warning(f"LinkManager item_changed error at ({row},{col}): {ex}")
             
-            if col == self.COL_EXPR:
-                self._apply_expr_from_cell(row, item.text())
-                self._propagate_to_selected_rows(src_row=row, col=col, value=item.text())
-        except Exception:
-            return
-            
-
-    # -------------- per-column appliers (source row) --------------
-
-    def _get_expr_for_row(self, row: int) -> LinkExpr | None:
-        """Retrieve LinkExpr for a row, checking ConstraintStore first, then LinkStore."""
-        try:
-            pref = self._row_targets[row]
-        except Exception:
-            return None
-        
-        # First, check ConstraintStore (new unified approach)
-        if self._constraint_store is not None:
-            try:
-                rule = self._constraint_store.get_constraint(pref)
-                if rule is not None:
-                    # Convert ConstraintRule to LinkExpr for backward compatibility
-                    return ConstraintRule_to_LinkExpr(rule)
-            except Exception:
-                pass
-        
-        # Fallback to LinkStore (legacy)
-        try:
-            return self._link_store.get(pref)
-        except Exception:
-            return None
-
-    def _apply_enabled_from_cell(self, row: int) -> None:
-        expr = self._get_expr_for_row(row)
-        if expr is None:
-            return
-        item = self.tbl.item(row, self.COL_ENABLED)
-        expr.enabled = (item.checkState() == QtCore.Qt.Checked)
-
-
-
-    def _type_txt_from_cell(self, row: int) -> str:
-        it = self.tbl.item(row, self.COL_TYPE)
-        return self._norm_type(it.text() if it else "LINEAR")
-
-    def _expr_txt_from_cell(self, row: int) -> str:
-        it = self.tbl.item(row, self.COL_EXPR)
-        return (it.text() if it else "").strip()
-
-    def _enabled_from_cell(self, row: int) -> bool:
-        it = self.tbl.item(row, self.COL_ENABLED)
-        if it is None:
-            return True
-        return it.checkState() == QtCore.Qt.Checked
-
     def _set_cell_text_blocked(self, row: int, col: int, text: str) -> None:
         self.tbl.blockSignals(True)
         try:
@@ -1025,149 +943,112 @@ class LinkManagerDialog(QtWidgets.QDialog):
         finally:
             self.tbl.blockSignals(False)
 
-    def _rebuild_constraint_from_row(self, row: int) -> None:
+    def _try_commit_row(self, row: int) -> None:
         """
-        Authoritative pipeline:
-          row cells -> ConstraintRule -> ConstraintStore
+        Safe, readiness-gated commit.
+        Implements:
+          - expr empty => not ready (no commit, no delete)
+          - driver may be inferred from expr for LINEAR if driver cell empty
+          - driver mismatch => UI error, no commit
+          - never raises
         """
-        if self._constraint_store is None:
+        st = getattr(self, "_constraint_store", None)
+        if st is None:
             return
 
-        target_pref = self._target_pref_from_row(row)
-        if target_pref is None:
-            return  # row not yet assigned
-
-        type_txt = self._type_txt_from_cell(row)
-        driver_pref = self._driver_pref_from_cell(row)
-        expr_txt = self._expr_txt_from_cell(row)
-        enabled = self._enabled_from_cell(row)
-
-        # If user cleared expr, interpret as "remove constraint"
-        if not expr_txt:
-            self._constraint_store.add_constraint(target_pref, None)
-            return
-
-        # Build rule
-        try:
-            rule = ConstraintRuleFactory.parse_row_to_constraint(
-                target=target_pref,
-                type_txt=type_txt,
-                driver=driver_pref,
-                expr_txt=expr_txt,
-            )
-            # unify enabled flag
-            try:
-                rule.enabled = bool(enabled)
-            except Exception:
-                pass
-
-            self._constraint_store.add_constraint(target_pref, rule)
-
-            # Optional: keep Type/Driver columns consistent with what the parser inferred
-            try:
-                self._set_cell_text_blocked(row, self.COL_TYPE, rule.constraint_type().name)
-            except Exception:
-                # If constraint_type() is not stable yet, keep existing text
-                pass
-            try:
-                if getattr(rule, "driver_pref", None) is not None:
-                    self._set_cell_text_blocked(row, self.COL_DRIVER, self._fmt_pref_safe(rule.driver_pref))
-                else:
-                    self._set_cell_text_blocked(row, self.COL_DRIVER, "(none)")
-            except Exception:
-                pass
-
-        except Exception:
-            # Parse/validation failed: do NOT crash; keep existing constraint unchanged.
-            # If you prefer "fail closed", uncomment the next line:
-            # self._constraint_store.add_constraint(target_pref, None)
-            return
-    def _driver_pref_from_cell(self, row: int):
-        txt = self._get_item_text(row, self.COL_DRIVER).strip()
-        if not txt or txt.lower() == "(none)":
-            return None
-        return ConstraintRuleFactory.parse_pref(txt)
-    
-    def _target_pref_for_row(self, row: int):
         self._ensure_row_targets_len(row)
-        return self._row_targets[row]
 
-    # --- Per-column apply handlers ---
-    def _commit_rule_for_row(self, row: int) -> None:
-        """
-        Authoritative pipeline:
-          row cells -> ConstraintRule -> ConstraintStore
-        No LinkExpr in the write path.
-        """
-        if getattr(self, "_constraint_store", None) is None:
+
+        # read UI cells
+        it = (self._get_item_text(row, self.COL_TYPE) or "").strip()
+        type_txt = self._norm_type(it) if it else "LINEAR"
+        driver_txt = (self._get_item_text(row, self.COL_DRIVER) or "").strip()
+        expr_txt = (self._get_item_text(row, self.COL_EXPR) or "").strip()
+        enabled = self._enabled_from_cell(row)
+
+        # 1) expr empty => not ready
+        if expr_txt == "":
             return
-            target_pref = self._target_pref_for_row(row)
+
+        expr_item = self.tbl.item(row, self.COL_EXPR)
+        drv_item  = self.tbl.item(row, self.COL_DRIVER)
+        if expr_item is not None:
+            self._clear_error(expr_item)
+        if drv_item is not None:
+            self._clear_error(drv_item)
+
+        # 2) Driver resolution + mismatch check for LINEAR
+        #    (Driver can be inferred from expr; if driver cell is present, it must match.)
+        try:
+            ct = resolve_constraint_type(type_txt)
+        except Exception as e:
+            if expr_item is not None:
+                self._mark_error(expr_item, f"Invalid constraint type '{type_txt}': {e}")
+            return
+
+        if ct == ConstraintType.LINEAR:
+            try:
+                # parse driver token from expr (does NOT commit)
+                _a, _b, drv_txt_from_expr = LinearConstraint.parse_UItext(expr_txt)
+                drv_pref_from_expr = txt_to_pref(drv_txt_from_expr)
+            except Exception as e:
+                if expr_item is not None:
+                    self._mark_error(expr_item, str(e))
+                return
+
+            # if driver cell empty, fill it from expr (optional but improves UX + consistency)
+            if driver_txt == "" or driver_txt.strip().lower() == "(none)":
+                if drv_item is not None:
+                    self._set_cell_text_blocked(row, self.COL_DRIVER, fmt_pref(drv_pref_from_expr))
+                driver_txt = fmt_pref(drv_pref_from_expr)
+            else:
+                # validate mismatch if driver cell is provided
+                try:
+                    drv_pref_from_cell = txt_to_pref(driver_txt)
+                except Exception as e:
+                    if drv_item is not None:
+                        self._mark_error(drv_item, str(e))
+                    return
+
+                if not pref_equal(drv_pref_from_cell, drv_pref_from_expr):
+                    msg = (
+                        f"Driver mismatch: driver cell '{fmt_pref(drv_pref_from_cell)}' "
+                        f"!= expr driver '{fmt_pref(drv_pref_from_expr)}'"
+                    )
+                    if drv_item is not None:
+                        self._mark_error(drv_item, msg)
+                    if expr_item is not None:
+                        self._mark_error(expr_item, msg)
+                    return
+
+        # 3) If everything is ok and target is available, convert row -> rule
+        #    row_to_rule may still raise for truly invalid expr; catch and mark.
+        target_pref = self._row_targets[row]
         if target_pref is None:
             return
-            type_txt = self._norm_type(self._get_item_text(row, self.COL_TYPE))
-        expr_txt = self._get_item_text(row, self.COL_EXPR).strip()
-        enabled = self._enabled_from_cell(row)
-            # optional: allow clearing expr to remove constraint
-        if not expr_txt:
-            self._constraint_store.add_constraint(target_pref, None)
+        try:
+            rule = row_to_rule(
+                target_pref=target_pref,
+                type_txt=type_txt,
+                driver_txt=driver_txt,
+                expr_txt=expr_txt,
+                enabled=enabled,
+            )
+        except Exception as e:
+            if expr_item is not None:
+                self._mark_error(expr_item, str(e))
             return
-            # driver from column (may be required depending on type/expr)
-        driver_pref = None
-        try:
-            driver_pref = self._driver_pref_from_cell(row)
-        except Exception:
-            driver_pref = None
-            # build rule from the 4-cell row
-        rule = ConstraintRuleFactory.parse_row_to_constraint(
-            target=target_pref,
-            type_txt=type_txt,
-            driver=driver_pref,
-            expr_txt=expr_txt,
-        )
-            # ---- critical fix: RELAX_EXP KV form currently sets driver_pref=None
-        # If the user provided Driver column and the produced RelaxDecayConstraint
-        # lacks a driver, bind it here.
-        if (
-            type_txt == "RELAX_EXP"
-            and driver_pref is not None
-            and isinstance(rule, RelaxDecayConstraint)
-            and getattr(rule, "driver_pref", None) is None
-        ):
-            rule.driver_pref = driver_pref
-            # persist enabled flag from UI
-        try:
-            rule.enabled = bool(enabled)
-        except Exception:
-            pass
-                # write to store
-        self._constraint_store.add_constraint(target_pref, rule)
-            # keep Type column canonical (optional)
-        try:
-            ct = rule.constraint_type()
-            self._set_text_blocked(row, self.COL_TYPE, ct.name if hasattr(ct, "name") else str(ct))
-        except Exception:
-            pass
-                # keep Driver column canonical (optional)
-        try:
-            drv = getattr(rule, "driver_pref", None)
-            self._set_text_blocked(row, self.COL_DRIVER, ConstraintRuleFactory._fmt_pref(drv) if drv else "(none)")
-        except Exception:
-            pass
-         
-    def _apply_enabled_from_cell(self, row: int) -> None:
-        self._commit_rule_for_row(row)
-    
-    def _apply_type_from_cell(self, row: int, text: str) -> None:
-        self._set_text_blocked(row, self.COL_TYPE, self._norm_type(text))
-        self._commit_rule_for_row(row)
-    
-    def _apply_driver_from_cell(self, row: int, text: str) -> None:
-        # let commit validate/parse; if invalid driver it may raise -> you can catch in caller
-        self._commit_rule_for_row(row)
-    
-    def _apply_expr_from_cell(self, row: int, text: str) -> None:
-        self._commit_rule_for_row(row)
 
+        # With the new rule, rule should never be None because expr_txt != ""
+        if rule is None:
+            return
+
+        try:
+            st.add_constraint(rule)
+        except Exception as e:
+            if expr_item is not None:
+                self._mark_error(expr_item, f"Commit failed: {e}")
+            return 
 
     def _apply_target_from_cell(self, row: int, text: str) -> None:
         """
@@ -1188,19 +1069,19 @@ class LinkManagerDialog(QtWidgets.QDialog):
 
         # parse new target
         try:
-            new_pref = ConstraintRuleFactory.parse_pref(new_txt)
+            new_pref = txt_to_pref(new_txt)
         except Exception:
             # revert target cell display
             if old_pref is not None:
-                self._set_text_blocked(row, self.COL_TARGET, ConstraintRuleFactory._fmt_pref(old_pref))
+                self._set_cell_text_blocked(row, self.COL_TARGET, fmt_pref(old_pref))
             return
 
         # no-op if unchanged
         if old_pref is not None:
             try:
-                if ConstraintRuleFactory._fmt_pref(old_pref) == ConstraintRuleFactory._fmt_pref(new_pref):
+                if fmt_pref(old_pref) == fmt_pref(new_pref):
                     self._row_targets[row] = new_pref
-                    self._set_text_blocked(row, self.COL_TARGET, ConstraintRuleFactory._fmt_pref(new_pref))
+                    self._set_cell_text_blocked(row, self.COL_TARGET, fmt_pref(new_pref))
                     return
             except Exception:
                 pass
@@ -1210,76 +1091,19 @@ class LinkManagerDialog(QtWidgets.QDialog):
         if st is not None and old_pref is not None:
             old_rule = st.get_constraint(old_pref)
             if old_rule is not None:
-                st.add_constraint(old_pref, None)
+                st.remove_constraint(old_pref)
                 try:
                     old_rule.target_pref = new_pref
                 except Exception:
                     pass
-                st.add_constraint(new_pref, old_rule)
+                st.add_constraint(old_rule)
 
         # update mapping + normalize cell text
         self._row_targets[row] = new_pref
-        self._set_text_blocked(row, self.COL_TARGET, ConstraintRuleFactory._fmt_pref(new_pref))
+        self._set_cell_text_blocked(row, self.COL_TARGET, fmt_pref(new_pref))
 
         # commit current row state under the new target key
-        self._commit_rule_for_row(row)
-
-    # -------------- propagation to other selected rows --------------
-
-    def _propagate_to_selected_rows(self, src_row: int, col: int, value) -> None:
-        sel = self.tbl.selectionModel()
-        if sel is None:
-            return
-
-        target_rows: list[int] = []
-        for idx in sel.selectedIndexes():
-            if idx.column() == col:
-                target_rows.append(idx.row())
-
-        # fallback: maybe user selected whole rows
-        if not target_rows:
-            for idx in sel.selectedRows():
-                target_rows.append(idx.row())
-
-        if not target_rows:
-            return
-
-        for r in target_rows:
-            if r == src_row:
-                continue
-            self._ensure_row_targets_len(r)
-
-            # per-column apply
-            if col == self.COL_ENABLED:
-                self.tbl.blockSignals(True)
-                it = self.tbl.item(r, col)
-                if it is None:
-                    it = QtWidgets.QTableWidgetItem()
-                    it.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-                    self.tbl.setItem(r, col, it)
-                it.setCheckState(value)
-                self.tbl.blockSignals(False)
-                self._apply_enabled_from_cell(r)
-
-            elif col in (self.COL_TARGET, self.COL_TYPE, self.COL_DRIVER, self.COL_EXPR):
-                self.tbl.blockSignals(True)
-                it = self.tbl.item(r, col)
-                if it is None:
-                    it = QtWidgets.QTableWidgetItem()
-                    self.tbl.setItem(r, col, it)
-                it.setText(str(value))
-                self.tbl.blockSignals(False)
-
-                # update backend too
-                if col == self.COL_TARGET:
-                    self._apply_target_from_cell(r, str(value))
-                elif col == self.COL_TYPE:
-                    self._apply_type_from_cell(r, str(value))
-                elif col == self.COL_DRIVER:
-                    self._apply_driver_from_cell(r, str(value))
-                elif col == self.COL_EXPR:
-                    self._apply_expr_from_cell(r, str(value))
-
+        self._try_commit_row(row)
 
     # --------------- buttons ---------------
     def _on_edit(self):
@@ -1295,37 +1119,18 @@ class LinkManagerDialog(QtWidgets.QDialog):
             constraint_store=self._constraint_store,
         )
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            # Try to get rule first (new pattern), then fall back to expr (legacy)
-            rule = dlg.result_rule()
-            if rule is not None:
+
+            new_rule = dlg.result_rule()
+            if new_rule is not None:
                 # ConstraintStore preferred if available
                 if self._constraint_store is not None:
-                    try:
-                        self._constraint_store.add_constraint(rule.target_pref, rule)
-                        self._reload()
-                    except Exception as e:
-                        # Fallback to legacy LinkStore
-                        new_expr = dlg.result_expr()
-                        if new_expr is not None:
-                            self._link_store.set_link(new_expr)
-                            self._reload()
-                else:
-                    # Only LinkStore available, convert rule to expr
-                    new_expr = dlg.result_expr()
-                    if new_expr is not None:
-                        self._link_store.set_link(new_expr)
-                        self._reload()
+                    self._constraint_store.add_constraint(new_rule)
+                    self._reload()
 
                 # If the expr is RELAX_EXP with T_name, ensure a registry row exists.
                 try:
-                    new_expr = dlg.result_expr()
-                    try:
-                        rule = LinkExpr_to_ConstraintRule(new_expr)
-                        is_relax = isinstance(rule, RelaxDecayConstraint)
-                    except Exception:
-                        is_relax = False
-                    if new_expr and is_relax:
-                        Tn = new_expr.args.get("T_name", None)
+                    if new_rule and isinstance(new_rule, RelaxDecayConstraint):
+                        Tn = new_rule.T_name  # Direct attribute access, not .args dict
                         if isinstance(Tn, str) and Tn.strip():
                             parent = self.parent()
                             if hasattr(parent, "_ensure_tseed_row"):
@@ -1558,16 +1363,17 @@ class LinkManagerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Import Links", "No rows found in file.")
             return
 
-        # clear existing
-        try:
-            for expr in list(self._link_store.all_expr()):
-                try:
-                    self._link_store.remove_link(expr.target)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+        # Clear global ConstraintStore
+        if self._constraint_store is not None:
+            try:
+                for target_pref, _ in list(self._constraint_store.all_constraints()):
+                    try:
+                        self._constraint_store.remove_constraint(target_pref)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        
         self.tbl.blockSignals(True)
         self.tbl.setRowCount(0)
         self._row_targets = []
@@ -1605,46 +1411,60 @@ class LinkManagerDialog(QtWidgets.QDialog):
             expr_item = QtWidgets.QTableWidgetItem(row["expr"])
             self.tbl.setItem(r, self.COL_EXPR, expr_item)
 
-            pref = self._parse_pref(row["target"])
+            pref = txt_to_pref(row["target"]) if row["target"] else None
             self._row_targets.append(pref)
 
-            # rebuild LinkStore
-
+            # Rebuild global ConstraintStore using row_to_rule factory
             if pref is not None:
-                type_txt  = self._norm_type(row["type"])            # "LINEAR" / "RELAX_EXP"
-                expr_txt  = (row["expr"] or "").strip()
-                driver_pref = self._parse_pref(row["driver"]) if row["driver"] else None
+                type_txt = self._norm_type(row["type"])  # "LINEAR" / "RELAX_EXP"
+                expr_txt = (row["expr"] or "").strip()
+                driver_txt = row["driver"] if row["driver"] else None
+                
+                # Use row_to_rule factory from constraint_rules.py
                 try:
-                    link_obj = self._parse_row_to_expr(
-                        target=pref,
+                    constraint_rule = row_to_rule(
+                        target_pref=pref,
                         type_txt=type_txt,
-                        driver=driver_pref,
-                        expr_txt=expr_txt
+                        driver_txt=driver_txt,
+                        expr_txt=expr_txt,
+                        enabled=is_enabled
                     )
                 except Exception:
-                    link_obj = None
-
-                if link_obj is not None:
-                    link_obj.enabled = is_enabled
+                    constraint_rule = None
+                
+                if constraint_rule is not None:
+                    # Add to global ConstraintStore
+                    if self._constraint_store is not None:
+                        try:
+                            self._constraint_store.add_constraint(constraint_rule)
+                        except Exception:
+                            pass
+                    
+                    # Legacy: also add to LinkStore for backward compatibility
                     try:
-                        self._link_store.set_link(link_obj)
+                        driver_pref = fmt_pref(driver_txt) if driver_txt else None
+                        link_obj = self._parse_row_to_expr(
+                            target=pref,
+                            type_txt=type_txt,
+                            driver=driver_pref,
+                            expr_txt=expr_txt
+                        )
+                        if link_obj is not None:
+                            link_obj.enabled = is_enabled
+                            self._link_store.set_link(link_obj)
                     except Exception:
                         pass
-                    # If the expr is RELAX_EXP with T_name, ensure a registry row exists.
-                    try:
+                    
+                    # If RELAX_EXP with T_name, ensure registry row exists
+                    if isinstance(constraint_rule, RelaxDecayConstraint):
                         try:
-                            rule = LinkExpr_to_ConstraintRule(link_obj)
-                            is_relax = isinstance(rule, RelaxDecayConstraint)
-                        except Exception:
-                            is_relax = False
-                        if link_obj and is_relax:
-                            Tn = link_obj.args.get("T_name", None)
+                            Tn = getattr(constraint_rule, "T_name", None)
                             if isinstance(Tn, str) and Tn.strip():
                                 parent = self.parent()
                                 if hasattr(parent, "_ensure_tseed_row"):
                                     parent._ensure_tseed_row(str(Tn).strip())
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
 
 
         self.tbl.blockSignals(False)
@@ -1669,6 +1489,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
 
 
 class _GenerateTargetsDialog(QtWidgets.QDialog):
+
     """
     Tiny helper dialog for LinkManagerDialog._on_generate_targets.
     Lets user pick:
@@ -2150,7 +1971,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
 
     def _update_preview(self):
         # Only for RELAX_EXP
-        if self.cmb_type.currentData() != LinkType.RELAX_EXP:
+        if self.cmb_type.currentData() != ConstraintType.RELAX_EXP:
             self.lbl_prev_human.setText("")
             self.lbl_prev_engine.setText("")
             return
@@ -2164,12 +1985,12 @@ class LinkEditorDialog(QtWidgets.QDialog):
 
         sid = int(self._target.slice_id)
         pid = int(self._target.peak_id)
-        tgt_txt = f"s{sid}_{self._target.name.lower()}_{pid}"
+        tgt_txt = f"s{sid}_{pid}_{self._target.name.lower()}"
 
         drv_sid = self.cmb_drv_slice.value()
         drv_pid = self.cmb_drv_peak.value()
         drv_param = COLUMN_NAMES[self.cmb_drv_param.currentIndex()]
-        drv_txt = f"s{drv_sid}_{drv_param.lower()}_{drv_pid}"
+        drv_txt = f"s{drv_sid}_{drv_pid}_{drv_param.lower()}"
 
         # human line
         T_human = T_term if is_named and T_term else (self.edt_T.text().strip() or "T")
@@ -2194,15 +2015,6 @@ class LinkEditorDialog(QtWidgets.QDialog):
                 rule = self._constraint_store.get_constraint(self._target)
             except Exception:
                 rule = None
-        
-        # Fall back to LinkStore (legacy)
-        if rule is None and self._link_store is not None:
-            try:
-                expr = self._link_store.get(self._target)
-                if expr is not None:
-                    rule = LinkExpr_to_ConstraintRule(expr)
-            except Exception:
-                expr = None
         
         if rule is None:
             # sensible defaults
@@ -2301,13 +2113,17 @@ class LinkEditorDialog(QtWidgets.QDialog):
                 except Exception:
                     pass
             
-            return LinearConstraint(
+            # Create constraint and generate expr_txt for display
+            linear_rule = LinearConstraint(
                 target_pref=self._target,
                 driver_pref=drv_pref,
                 a=float(self.edt_a.value()),
                 b=float(self.edt_b.value()),
                 enabled=self.chk_enabled.isChecked()
             )
+            # Generate expr_txt using rule_to_expr() so it displays in LinkManagerDialog
+            linear_rule.expr_txt = linear_rule.rule_to_expr()
+            return linear_rule
 
         # RELAX_EXP
         elif t == "RELAX_EXP":
@@ -2342,6 +2158,12 @@ class LinkEditorDialog(QtWidgets.QDialog):
             if (self._times is None) or (t_sec > 0):
                 time_override = float(t_sec)
 
+            # Build expression text for display in LinkManagerDialog
+            drv_txt = fmt_pref(drv_pref)
+            T_term = T_name if T_name else str(T_seconds)
+            t_val = time_override if time_override is not None else "t"
+            expr_txt = f"{drv_txt}*{A_val}*exp(-{t_val}/{T_term})+{C_val}"
+
             return RelaxDecayConstraint(
                 target_pref=self._target,
                 driver_pref=drv_pref,
@@ -2350,27 +2172,11 @@ class LinkEditorDialog(QtWidgets.QDialog):
                 C=C_val,
                 time_seconds=time_override,
                 T_name=T_name,
+                expr_txt=expr_txt,
                 enabled=self.chk_enabled.isChecked()
             )
         
         return None
-
-    def result_expr(self) -> Optional[LinkExpr]:
-        """
-        Return a LinkExpr object (legacy pattern for backward compatibility).
-        
-        This delegates to result_rule() and converts ConstraintRule back to LinkExpr.
-        """
-        rule = self.result_rule()
-        if rule is None:
-            return None
-        
-        try:
-            return ConstraintRule_to_LinkExpr(rule)
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Error", f"Failed to convert rule: {e}")
-            return None
-
 
 # --------------------------- View context menu wiring ---------------------------
 
@@ -2383,6 +2189,9 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
     
     Supports both new ConstraintStore (preferred) and legacy LinkStore (fallback).
     """
+    # Extract constraint_store from kwargs (should be passed by caller)
+    constraint_store_param = kwargs.get('constraint_store', None)
+    
     view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
 
     def _on_menu(pos: QtCore.QPoint):
@@ -2396,12 +2205,10 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
         menu = QtWidgets.QMenu(view)
         act_edit = menu.addAction("Edit Constraint…")
         
-        # Check both constraint_store and legacy links
+        # Check if constraint exists
         has_constraint = False
         if hasattr(model, '_constraint_store') and model._constraint_store is not None:
             has_constraint = model._constraint_store.get_constraint(pref) is not None
-        elif hasattr(model, '_links') and model._links is not None:
-            has_constraint = model._links.is_linked(pref)
         
         act_clear = menu.addAction("Clear Constraint") if has_constraint else None
         act_bounds = menu.addAction("Set Bounds…")
@@ -2412,24 +2219,23 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
             return
 
         if chosen == act_edit:
-            # Prefer constraint_store (new) over links (legacy)
-            constraint_store = getattr(model, '_constraint_store', None)
-            link_store = getattr(model, '_links', None)
+            # Use constraint_store from parameter (same object as LinkManagerDialog uses)
+            constraint_store = constraint_store_param or getattr(model, '_constraint_store', None)
             
             dlg = LinkEditorDialog(
                 parent or view,
                 target=pref,
                 slice_count=slice_count,
                 peaks_per_slice=peaks_per_slice,
-                link_store=link_store,
-                constraint_store=constraint_store,  # Pass new store
+                link_store=None,  # Legacy: not used when constraint_store present
+                constraint_store=constraint_store,
             )
             if dlg.exec_() == QtWidgets.QDialog.Accepted:
                 # Try new pattern first (ConstraintRule)
                 rule = dlg.result_rule()
                 if rule is not None and constraint_store is not None:
                     # Store as ConstraintRule
-                    constraint_store.add_constraint(pref, rule)
+                    constraint_store.add_constraint(rule)
                     model.dataChanged.emit(idx, idx, [
                         QtCore.Qt.DisplayRole, QtCore.Qt.EditRole, QtCore.Qt.ForegroundRole, QtCore.Qt.ToolTipRole
                     ])
@@ -2444,38 +2250,12 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
                                     mw._ensure_tseed_row(tname)
                     except Exception:
                         pass
-                else:
-                    # Fallback to legacy LinkExpr pattern
-                    expr = dlg.result_expr()
-                    if expr is not None and link_store is not None:
-                        link_store.set_link(expr)
-                        model.dataChanged.emit(idx, idx, [
-                            QtCore.Qt.DisplayRole, QtCore.Qt.EditRole, QtCore.Qt.ForegroundRole, QtCore.Qt.ToolTipRole
-                        ])
-                        
-                        mw = parent or view
-                        try:
-                            try:
-                                rule = LinkExpr_to_ConstraintRule(expr)
-                                is_relax = isinstance(rule, RelaxDecayConstraint)
-                            except Exception:
-                                is_relax = False
-                            if is_relax:
-                                tname = expr.args.get("T_name") or expr.args.get("t_name")
-                                if isinstance(tname, str) and tname.strip():
-                                    tname = tname.strip()
-                                    if hasattr(mw, "_ensure_tseed_row"):
-                                        mw._ensure_tseed_row(tname)
-                        except Exception:
-                            pass
 
         elif act_clear and chosen == act_clear:
-            # Clear from constraint_store (new) or links (legacy)
+            # Clear constraint from store
             if hasattr(model, '_constraint_store') and model._constraint_store is not None:
-                model._constraint_store.add_constraint(pref, None)
-            elif hasattr(model, '_links') and model._links is not None:
-                model._links.remove_link(pref)
-            
+                model._constraint_store.remove_constraint(pref)
+
             model.dataChanged.emit(idx, idx, [
                 QtCore.Qt.DisplayRole, QtCore.Qt.EditRole, QtCore.Qt.ForegroundRole, QtCore.Qt.ToolTipRole
             ])
@@ -3066,10 +2846,6 @@ def Peaks_to_ParamRefList(sid: int, peaks: List):
             ParamRefList.append(pref)
     return ParamRefList
 
-def ParamRef_to_key(pref: ParamRef):
-    key = f"s{int(pref.slice_id)}_p{int(pref.peak_id)}_{str(pref.name)}"
-    return key
-
 def global_ref(sid: int, name: str) -> "ParamRef":
     # globals still follow the same rule by using peak_id = 000
     return ParamRef(slice_id=int(sid), peak_id=000, name=str(name))
@@ -3137,16 +2913,16 @@ class FitContext:
         #Parameters always contains pos lor and gauss in Hz
         p = Parameters()
 
-        p.add(f'{ParamRef_to_key(global_ref(sid, "mult"))}', value=float(multiplier), min=0.0)
-        p.add(f'{ParamRef_to_key(global_ref(sid, "offset"))}', value=float(offset))
-        p.add(f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}', value=0.0, min=-180.0, max=180.0)
+        p.add(f'{fmt_pref(global_ref(sid, "mult"))}', value=float(multiplier), min=0.0)
+        p.add(f'{fmt_pref(global_ref(sid, "offset"))}', value=float(offset))
+        p.add(f'{fmt_pref(global_ref(sid, "phi0_deg"))}', value=0.0, min=-180.0, max=180.0)
 
         for pid in range(len(peaks)):
             pk = peaks[pid]
             pref_pos = ParamRef(slice_id=sid, peak_id=pid, name="pos")
-            name_pos = ParamRef_to_key(pref_pos)
+            name_pos = fmt_pref(pref_pos)
             pref_gauss = ParamRef(slice_id=sid, peak_id=pid, name="gauss")
-            name_gauss = ParamRef_to_key(pref_gauss)
+            name_gauss = fmt_pref(pref_gauss)
             if self.axis_mode.lower() == 'ppm':
                 p.add(f'{name_pos}',   value=float(ppm_to_hz(pk.pos, self.ref)))
                 p.add(f'{name_gauss}',   value=max(1e-9, float(ppm_to_hz(pk.gauss_disp, self.ref))), min=0.0)
@@ -3155,11 +2931,11 @@ class FitContext:
                 p.add(f'{name_gauss}', value=max(1e-6, float(pk.gauss_disp)), min=0.0)
 
             pref_lor = ParamRef(slice_id=sid, peak_id=pid, name="lor")
-            name_lor = ParamRef_to_key(pref_lor)
+            name_lor = fmt_pref(pref_lor)
             p.add(f'{name_lor}',   value=max(1.0, float(pk.lor_hz)), min=0.0)
             
             pref_amp = ParamRef(slice_id=sid, peak_id=pid, name="amp")
-            name_amp = ParamRef_to_key(pref_amp)
+            name_amp = fmt_pref(pref_amp)
             p.add(f'{name_amp}',   value=max(1e-9, float(pk.amp)), min=0.0)
 
         return p
@@ -3167,10 +2943,10 @@ class FitContext:
     def result_to_peaks(self, peaks: List[Peak], params: Parameters, sid: int) -> None:
 
         for i in range(len(peaks)):
-            peaks[i].pos        = hz_to_ppm(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value
-            peaks[i].amp        = params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value
-            peaks[i].lor_hz     = params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value
-            peaks[i].gauss_disp = hz_to_ppm(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value
+            peaks[i].pos        = hz_to_ppm(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value
+            peaks[i].amp        = params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value
+            peaks[i].lor_hz     = params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value
+            peaks[i].gauss_disp = hz_to_ppm(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value
 
 
 
@@ -3194,10 +2970,10 @@ class FitContext:
         peaks: List[Peak] = []
         for i in range(no_of_peaks):
             peaks.append(Peak(
-                pos=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, #Hz
-                amp=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value,
-                lor_hz=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value, #Hz
-                gauss_disp=params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, #Hz
+                pos=params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].value, #Hz
+                amp=params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].value,
+                lor_hz=params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value, #Hz
+                gauss_disp=params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, #Hz
             ))
 
         x_disp = np.asarray(self.x, dtype=float)
@@ -3211,13 +2987,13 @@ class FitContext:
             sw_hz=self.sw_hz,
             N=len(self.x),
             x=x_hz,                         # pass current display axis; orchestrator canonicalizes
-            multiplier=params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].value,
+            multiplier=params[f'{fmt_pref(global_ref(sid, "mult"))}'].value,
             return_fid=False,
         )
 
         # --- apply ONLY zero-order phase and offset ---
-        phi0   = params.get(f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}', 0.0).value
-        offset = params.get(f'{ParamRef_to_key(global_ref(sid, "offset"))}',   0.0).value
+        phi0   = params.get(f'{fmt_pref(global_ref(sid, "phi0_deg"))}', 0.0).value
+        offset = params.get(f'{fmt_pref(global_ref(sid, "offset"))}',   0.0).value
         model = apply_phase_and_offset(spec_c, phi0, offset)
 
         # --- residual on display grid ---
@@ -3330,7 +3106,7 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         self._peaks = peaks if peaks is not None else []                  # List[Peak]
         self._fix   = fix_flags if fix_flags is not None else []          # List[Tuple[bool,bool,bool,bool]]
         self._redchi = redchi if redchi is not None else float("nan")     # float
-        self._links = None  # LinkStore
+        self._constraint_store = None  # ConstraintStore
         self._slice_index_provider = None  # callable -> int
         # map visible columns to param names
         self._col_to_name = {0: "pos", 2: "amp", 4: "lor", 6: "gauss"}
@@ -3450,20 +3226,19 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.TextAlignmentRole:
             return QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
 
-        # Show link hint tooltip
-        if role == QtCore.Qt.ToolTipRole and self._links and (c in self._col_to_name):
+        # Show constraint hint tooltip
+        if role == QtCore.Qt.ToolTipRole and (c in self._col_to_name):
             tips = []
-            # link tip
-            if self._links:
-                pref = self.index_to_paramref(index)
-                if pref and self._links.is_linked(pref):
-                    expr = self._links.get(pref)
-                    if expr and expr.type == LinkType.LINEAR and expr.driver:
-                        tips.append(f"Linked: {pref.name} ← a*driver + b")
-                    elif expr and expr.type == LinkType.RELAX_EXP:
-                        tips.append("Linked: decay y=A*exp(-t/T)+C")
-            # bounds tip
             pref = self.index_to_paramref(index)
+            # constraint tip
+            if pref and self._constraint_store:
+                rule = self._constraint_store.get_constraint(pref)
+                if rule:
+                    if isinstance(rule, LinearConstraint):
+                        tips.append(f"Constrained: {pref.name} ← a*driver + b")
+                    elif isinstance(rule, RelaxDecayConstraint):
+                        tips.append("Constrained: decay y=A*exp(-t/T)+C")
+            # bounds tip
             if pref:
                 b = self.get_bounds_for(pref)
                 if b.is_set():
@@ -3472,10 +3247,12 @@ class PeakTableModel(QtCore.QAbstractTableModel):
                     tips.append(f"Bounds: [{lo}, {hi}]")
             return " | ".join(tips) if tips else None
          
-        if role == QtCore.Qt.ForegroundRole and self._links and (c in self._col_to_name):
+        if role == QtCore.Qt.ForegroundRole and (c in self._col_to_name):
             pref = self.index_to_paramref(index)
-            if pref and self._links.is_linked(pref):
-                return QtGui.QBrush(QtGui.QColor("#827F7F"))
+            if pref and self._constraint_store:
+                rule = self._constraint_store.get_constraint(pref)
+                if rule:
+                    return QtGui.QBrush(QtGui.QColor("#827F7F"))
 
         return None   
 
@@ -3487,10 +3264,12 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         c = index.column()
         if self._is_fix_col(c):
             return base | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled
-        if self._links and (c in self._col_to_name):
+        if (c in self._col_to_name) and self._constraint_store:
             pref = self.index_to_paramref(index)
-            if pref and self._links.is_linked(pref):
-                return (base | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable) & ~QtCore.Qt.ItemIsEditable
+            if pref:
+                rule = self._constraint_store.get_constraint(pref)
+                if rule:
+                    return (base | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable) & ~QtCore.Qt.ItemIsEditable
         return base | QtCore.Qt.ItemIsEditable
 
     def setData(self, index, value, role=QtCore.Qt.EditRole):
@@ -3563,9 +3342,9 @@ class PeakTableModel(QtCore.QAbstractTableModel):
         else:
             return f"{v:.3f}"   # 3 digits after decimal, fixed notation
    
-    # Bind LinkStore and a provider for current slice index to link parameters
-    def bind_links(self, store, *, slice_index_provider=None):
-        self._links = store
+    # Bind ConstraintStore and a provider for current slice index
+    def bind_constraint_store(self, store: ConstraintStore, *, slice_index_provider=None):
+        self._constraint_store = store
         self._slice_index_provider = slice_index_provider
         self.layoutChanged.emit()
     # Set bound for parameters
@@ -4011,6 +3790,7 @@ class  MainWindow(QMainWindow):
         self.slice_index = 0 # int
         self.slice_states = {} # : dict[int, SliceFitState()]
         self.slice_states[0] = SliceFitState()
+        self.constraint_store = ConstraintStore()
         
         self.link_store = LinkStore()
         # ---- T-seed registry (authoritative) ----
@@ -4251,8 +4031,8 @@ class  MainWindow(QMainWindow):
         for c in (0, 2, 4, 6):
             self.tbl.setItemDelegateForColumn(c, delegate)
 
-        # A6: bind links to model and provide current slice index
-        self.peak_model.bind_links(self.link_store, slice_index_provider=lambda: getattr(self, "slice_index", 0))
+        # Bind constraint store to model and provide current slice index
+        self.peak_model.bind_constraint_store(self.constraint_store, slice_index_provider=lambda: getattr(self, "slice_index", 0))
         
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)  # optional
@@ -4281,6 +4061,7 @@ class  MainWindow(QMainWindow):
             peaks_per_slice=_peaks_per_slice_snapshot,
             get_target_from_index=self.peak_model.index_to_paramref,
             link_store=self.link_store,
+            constraint_store=getattr(self, 'constraint_store', None),  # Pass same store as LinkManagerDialog
             enable_linear=True,
             enable_decay=True,   # placeholder
             enable_growth=False   # placeholder
@@ -5563,7 +5344,7 @@ class  MainWindow(QMainWindow):
         self.display_slice(int(val), preserve_view=True)
         self.update_ui_state()
         
-        # Phase 6B: Refresh constraint status when slice changes
+
         if hasattr(self, 'on_refresh_constraint_status'):
             self.on_refresh_constraint_status()
 
@@ -5888,38 +5669,38 @@ class  MainWindow(QMainWindow):
             params = ctx.build_params(peaks, sid, self.multiplier, self.offset) #params is a Paramters instance aka a dictionary
 
             # globals vary/freeze
-            params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].set(vary=not self.fix_mult,    value=self.multiplier)
-            params[f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}'].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params[f'{ParamRef_to_key(global_ref(sid, "offset"))}'].set(vary=not self.fix_offset, value=self.offset)        
+            params[f'{fmt_pref(global_ref(sid, "mult"))}'].set(vary=not self.fix_mult,    value=self.multiplier)
+            params[f'{fmt_pref(global_ref(sid, "phi0_deg"))}'].set(vary=not self.fix_phi0, value=self.phi0_deg)
+            params[f'{fmt_pref(global_ref(sid, "offset"))}'].set(vary=not self.fix_offset, value=self.offset)        
 
             for i in range(len(peaks)):
-                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'],   self.peak_model, sid, i, "pos",   self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'], self.peak_model, sid, i, "gauss", self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'],   self.peak_model, sid, i, "amp",   self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'],   self.peak_model, sid, i, "lor",   self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'],   self.peak_model, sid, i, "pos",   self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'], self.peak_model, sid, i, "gauss", self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'],   self.peak_model, sid, i, "amp",   self.axis_mode, self.ref)
+                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'],   self.peak_model, sid, i, "lor",   self.axis_mode, self.ref)
 
             for i in range(len(peaks)):
                 b_lor = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="lor")) if self.peak_model else None
                 if not (b_lor and b_lor.is_set()):
-                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].min = 0.0
-                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].max = 10000.0
+                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].min = 0.0
+                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].max = 10000.0
 
                 b_g = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="gauss")) if self.peak_model else None
                 if not (b_g and b_g.is_set()):
-                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].min = 0.0
-                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].max = 10000
+                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].min = 0.0
+                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].max = 10000
 
                 b_a = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="amp")) if self.peak_model else None
                 if not (b_a and b_a.is_set()):
-                    params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].min = 0.0
+                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].min = 0.0
 
             # 4) Apply per-peak vary for lmfit from GUI fix flags. lmfit set vary = 1. GUI set fix = 1 to be consistent with ssnake
             for i in range(len(peaks)):
                 fpos, famp, flor, fgauss = fix_flags[i]
-                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].vary   = not fpos
-                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].vary   = not famp
-                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].vary   = not flor
-                params[f'{ParamRef_to_key(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].vary = not fgauss
+                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].vary   = not fpos
+                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].vary   = not famp
+                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].vary   = not flor
+                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].vary = not fgauss
 
             # 5) Resolve links for THIS slice: seed external drivers + evaluate + freeze linked targets
             s = int(getattr(self, "slice_index", 0))
@@ -5994,9 +5775,9 @@ class  MainWindow(QMainWindow):
 
             # 8) Update peaks & globals from result
             ctx.result_to_peaks(peaks, result.params, sid)
-            self.multiplier = result.params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].value
-            self.offset     = result.params[f'{ParamRef_to_key(global_ref(sid, "offset"))}'].value
-            self.phi0_deg   = result.params[f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}'].value
+            self.multiplier = result.params[f'{fmt_pref(global_ref(sid, "mult"))}'].value
+            self.offset     = result.params[f'{fmt_pref(global_ref(sid, "offset"))}'].value
+            self.phi0_deg   = result.params[f'{fmt_pref(global_ref(sid, "phi0_deg"))}'].value
 
             # UI widgets reflect new globals (block signals while setting)
             for w in (self.edt_mult, self.edt_offset):
@@ -6191,9 +5972,9 @@ class  MainWindow(QMainWindow):
         # Scatter back per slice; refresh caches/UI
         for sid, ctx, tmpl, fix_flags, pre in slice_ctxs:
             ctx.result_to_peaks(tmpl, result.params, prefix=pre)
-            mult_val  = result.params[f'{ParamRef_to_key(global_ref(sid, "mult"))}'].value
-            off_val   = result.params[f'{ParamRef_to_key(global_ref(sid, "offset"))}'].value
-            phi0_val  = result.params[f'{ParamRef_to_key(global_ref(sid, "phi0_deg"))}'].value
+            mult_val  = result.params[f'{fmt_pref(global_ref(sid, "mult"))}'].value
+            off_val   = result.params[f'{fmt_pref(global_ref(sid, "offset"))}'].value
+            phi0_val  = result.params[f'{fmt_pref(global_ref(sid, "phi0_deg"))}'].value
 
             st = self.slice_states.get(sid) or SliceFitState()
             self.slice_states[sid] = st
@@ -6340,7 +6121,7 @@ class  MainWindow(QMainWindow):
         """
         """
         New version: do ALL linking in ParamRef-space.
-        lmfit names are produced ONLY by ParamRef_to_key(ParamRef).
+        lmfit names are produced ONLY by fmt_pref(ParamRef).
         Naming rule: s{sid}_p{pid}_{name}
         Globals use pid=-1: s{sid}_p-1_mult, etc.
         """
@@ -6402,10 +6183,10 @@ class  MainWindow(QMainWindow):
 
             # bounds (use ParamRef directly)
             for pid in range(len(peaks)):
-                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "pos"))],   self.peak_model, sid, pid, "pos",   axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "gauss"))], self.peak_model, sid, pid, "gauss", axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "amp"))],   self.peak_model, sid, pid, "amp",   axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[ParamRef_to_key(ParamRef(sid, pid, "lor"))],   self.peak_model, sid, pid, "lor",   axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "pos"))],   self.peak_model, sid, pid, "pos",   axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "gauss"))], self.peak_model, sid, pid, "gauss", axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "amp"))],   self.peak_model, sid, pid, "amp",   axis_mode, ref_MHz)
+                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "lor"))],   self.peak_model, sid, pid, "lor",   axis_mode, ref_MHz)
 
             # fallback bounds if model does not provide
             for pid in range(len(peaks)):
@@ -6413,27 +6194,27 @@ class  MainWindow(QMainWindow):
                     pref = ParamRef(slice_id=sid, peak_id=pid, name=nm)
                     b = self.peak_model.get_bounds_for(pref) if self.peak_model else None
                     if not (b and b.is_set()):
-                        k = ParamRef_to_key(pref)
+                        k = fmt_pref(pref)
                         params_all[k].min = 0.0
                         params_all[k].max = float(default_max)
 
                 prefA = ParamRef(slice_id=sid, peak_id=pid, name="amp")
                 bA = self.peak_model.get_bounds_for(prefA) if self.peak_model else None
                 if not (bA and bA.is_set()):
-                    params_all[ParamRef_to_key(prefA)].min = 0.0
+                    params_all[fmt_pref(prefA)].min = 0.0
 
             # global fixed flags (globals are pid=-1 now)
-            params_all[ParamRef_to_key(global_ref(sid, "mult"))].set(vary=not self.fix_mult,   value=self.multiplier)
-            params_all[ParamRef_to_key(global_ref(sid, "phi0_deg"))].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params_all[ParamRef_to_key(global_ref(sid, "offset"))].set(vary=not self.fix_offset, value=self.offset)
+            params_all[fmt_pref(global_ref(sid, "mult"))].set(vary=not self.fix_mult,   value=self.multiplier)
+            params_all[fmt_pref(global_ref(sid, "phi0_deg"))].set(vary=not self.fix_phi0, value=self.phi0_deg)
+            params_all[fmt_pref(global_ref(sid, "offset"))].set(vary=not self.fix_offset, value=self.offset)
 
             # per-peak fixed flags
             for pid in range(len(peaks)):
                 fpos, famp, flor, fgauss = fix_flags[pid]
-                params_all[ParamRef_to_key(ParamRef(sid, pid, "pos"))].vary   = not fpos
-                params_all[ParamRef_to_key(ParamRef(sid, pid, "amp"))].vary   = not famp
-                params_all[ParamRef_to_key(ParamRef(sid, pid, "lor"))].vary   = not flor
-                params_all[ParamRef_to_key(ParamRef(sid, pid, "gauss"))].vary = not fgauss
+                params_all[fmt_pref(ParamRef(sid, pid, "pos"))].vary   = not fpos
+                params_all[fmt_pref(ParamRef(sid, pid, "amp"))].vary   = not famp
+                params_all[fmt_pref(ParamRef(sid, pid, "lor"))].vary   = not flor
+                params_all[fmt_pref(ParamRef(sid, pid, "gauss"))].vary = not fgauss
 
             slice_ctxs.append((sid, ctx, [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks], fix_flags))
 
@@ -6484,7 +6265,7 @@ class  MainWindow(QMainWindow):
                     drv_name = canon_name(drv.name)
                     if drv_name not in ("pos", "amp", "lor", "gauss"):
                         report["errors"].append(
-                            f"Link target {ParamRef_to_key(tgt_ref)} has unsupported driver name '{drv.name}'."
+                            f"Link target {fmt_pref(tgt_ref)} has unsupported driver name '{drv.name}'."
                         )
                         return params_all, slice_ctxs, report
 
@@ -6514,7 +6295,7 @@ class  MainWindow(QMainWindow):
                         else:
                             if slice_times is None:
                                 report["errors"].append(
-                                    f"Exponential link on {ParamRef_to_key(tgt_ref)} requires time data "
+                                    f"Exponential link on {fmt_pref(tgt_ref)} requires time data "
                                     "(load time_echo.txt or set t_override)."
                                 )
                                 return params_all, slice_ctxs, report
@@ -6522,7 +6303,7 @@ class  MainWindow(QMainWindow):
                                 t_sec = float(slice_times[sid])
                             except Exception:
                                 report["errors"].append(
-                                    f"Exponential link on {ParamRef_to_key(tgt_ref)} cannot find time for slice {sid}."
+                                    f"Exponential link on {fmt_pref(tgt_ref)} cannot find time for slice {sid}."
                                 )
                                 return params_all, slice_ctxs, report
 
@@ -6530,7 +6311,7 @@ class  MainWindow(QMainWindow):
                         if "T_name" in expr.args:
                             T_name = str(expr.args["T_name"]).strip()
                             if not T_name:
-                                report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has empty T_name.")
+                                report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has empty T_name.")
                                 return params_all, slice_ctxs, report
 
                             k_name = f"k__{T_name}"
@@ -6546,25 +6327,25 @@ class  MainWindow(QMainWindow):
                                 k_lo, k_hi = _T_bounds_to_k_bounds(seed_for_T.get("T_lo_s"), seed_for_T.get("T_hi_s"))
                                 apply_Tbounds_to_param(params_all[k_name], k_lo, k_hi)
 
-                            report["T_results"].setdefault(T_name, []).append(ParamRef_to_key(tgt_ref))
+                            report["T_results"].setdefault(T_name, []).append(fmt_pref(tgt_ref))
                             k_term = k_name
 
                         elif "T_value" in expr.args:
                             T_val = float(expr.args["T_value"])
                             if T_val <= 0:
-                                report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has non-positive T_value.")
+                                report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has non-positive T_value.")
                                 return params_all, slice_ctxs, report
                             k_term = f"{(1.0 / T_val):.12g}"
 
                         elif "T" in expr.args:
                             T_val = float(expr.args["T"])
                             if T_val <= 0:
-                                report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has non-positive T.")
+                                report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has non-positive T.")
                                 return params_all, slice_ctxs, report
                             k_term = f"{(1.0 / T_val):.12g}"
 
                         else:
-                            report["errors"].append(f"Exponential link on {ParamRef_to_key(tgt_ref)} has no T_name nor T_value.")
+                            report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has no T_name nor T_value.")
                             return params_all, slice_ctxs, report
 
                         C_val = float(expr.args.get("C", 0.0))
@@ -6639,8 +6420,8 @@ class  MainWindow(QMainWindow):
 
             # 3a) linear
             for tgt_ref, drv_ref, a, b in pending_linear:
-                tgt_key = ParamRef_to_key(tgt_ref)
-                drv_key = ParamRef_to_key(drv_ref)
+                tgt_key = fmt_pref(tgt_ref)
+                drv_key = fmt_pref(drv_ref)
 
                 if tgt_key not in params_all:
                     missing.append(f"target {tgt_key}")
@@ -6660,8 +6441,8 @@ class  MainWindow(QMainWindow):
 
             # 3b) exponential
             for tgt_ref, drv_ref, A_val, t_sec, k_term, C_val in pending_exp:
-                tgt_key = ParamRef_to_key(tgt_ref)
-                drv_key = ParamRef_to_key(drv_ref)
+                tgt_key = fmt_pref(tgt_ref)
+                drv_key = fmt_pref(drv_ref)
 
                 if tgt_key not in params_all:
                     missing.append(f"target {tgt_key} (exponential)")
@@ -6685,7 +6466,7 @@ class  MainWindow(QMainWindow):
             # sanity: linked targets should be derived (expr set) and not vary
             bad = []
             for tgt_ref, _drv_ref, _a, _b in pending_linear:
-                tgt_key = ParamRef_to_key(tgt_ref)
+                tgt_key = fmt_pref(tgt_ref)
                 if tgt_key in params_all:
                     tpar = params_all[tgt_key]
                     if not getattr(tpar, "expr", ""):

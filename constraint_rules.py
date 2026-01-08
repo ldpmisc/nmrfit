@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, TYPE_CHECKING
+from typing import List, Optional, Dict, Any, TYPE_CHECKING, Tuple, Iterable, Set
 from enum import Enum
-import numpy as np
+import numpy as np  # Add missing import for np.isfinite
 
 # Use TYPE_CHECKING to avoid circular import at runtime
 # nmrFit_v0 → constraint_rules, constraint_rules → nmrFit_v0 creates cycle
@@ -17,33 +17,156 @@ class ParamRef:
     peak_id: int
     name: str             # "pos" | "amp" | "lor" | "gauss"
 
-def _fmt_pref(self, pref: ParamRef) -> str:
+def fmt_pref(pref: ParamRef) -> str:
     return f"s{pref.slice_id}_p{pref.peak_id}_{pref.name.lower()}"
 
-#def _fmt_exp_args(self, args: dict, driver: ParamRef) -> str:
-#    drv_txt = self._fmt_pref(driver) if driver else "(None)"
-#    A = args.get("A", 1.0)
-#    k = args.get("t_override", 1.0)
-#    C = args.get("C", 0.0)
-#    denom = args.get("T_name") or args.get("T", "?")
-#    return f"{drv_txt}*{A:g}*exp(-{k:g}/{denom}+{C:g})"
-#
-#def _fmt_linear_args(self, args: dict, driver: ParamRef) -> str:
-#    drv_txt = self._fmt_pref(driver) if driver else "(None)"
-#    a = args.get("a", 1.0)
-#    b = args.get("b", 0.0)
-#    if b == 0:
-#        return f"{a:g}*{drv_txt}"
-#    return f"{a:g}*{drv_txt} + {b:g}"
+def txt_to_pref(txt: str) -> ParamRef:
+    """
+    Convert text like "s15_p1_amp" into ParamRef.
+    Raises ValueError for malformed text.
+    """
+    if txt is None:
+        return None
+    
+    t = txt.strip().lower()
+    if txt is None:
+        return None
 
-def _pref_equal(self, a: ParamRef, b: ParamRef) -> bool:
+    # tolerate GUI placeholders / empty edits
+    if isinstance(txt, str):
+        t = txt.strip().lower()
+    else:
+        raise ValueError(f"ParamRef '{txt}' must be a string")
+
+    if t == "" or t == "(none)":
+        return None
+
+    name_map = {
+        "pos": "pos", "position": "pos", "freq": "pos", "pos_hz": "pos", "pos_ppm": "pos",
+        "amp": "amp", "area": "amp", "amplitude": "amp",
+        "lor": "lor", "lorentz": "lor", "lor_hz": "lor", "lorentz_hz": "lor",
+        "gauss": "gauss", "gauss_disp": "gauss",
+    }
+    try:
+        s_part, p_part, name_part = t.split("_", 2)
+        slice_id = int(s_part[1:])
+        peak_id = int(p_part[1:])
+        normalized_name = name_part.strip().lower()
+
+        if normalized_name not in name_map:
+            raise ValueError(f"ParamRef '{txt}' has invalid parameter name '{name_part}'")
+        name = name_map.get(normalized_name)
+        return ParamRef(slice_id=slice_id, peak_id=peak_id, name=name)
+    
+    except Exception as e:
+        raise ValueError(f"Malformed ParamRef '{txt}': {e}")
+
+def pref_equal(a: ParamRef, b: ParamRef) -> bool:
         return int(a.slice_id) == int(b.slice_id) and int(a.peak_id) == int(b.peak_id) and str(a.name).lower() == str(b.name).lower()
+
+def _is_float(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+def _get_peak_value(peak: 'Peak', param_name: str) -> float:
+    """Extract parameter value from Peak object."""
+    param_name = str(param_name).lower().strip()
+    
+    if param_name == "pos":
+        return float(peak.pos)
+    elif param_name == "amp":
+        return float(peak.amp)
+    elif param_name == "lor":
+        return float(peak.lor_hz)
+    elif param_name == "gauss":
+        return float(peak.gauss_disp)
+    else:
+        raise ValueError(f"Unknown peak parameter: {param_name}")
 
 class ConstraintType(Enum):
     """Enumeration of supported constraint types."""
     LINEAR = "LINEAR"
     RELAX_EXP = "RELAX_EXP"
 
+# Registry for mapping ConstraintType to ConstraintRule subclass
+CONSTRAINT_RULE_REGISTRY: Dict[ConstraintType, Any] = {}
+
+def register_constraint_rule(ct: ConstraintType, cls: Any) -> None:
+    """
+    Register a rule class for a ConstraintType. See at the bottom of this file.
+    Use explicitly (static dict style) so extension is tracked.
+    """
+    CONSTRAINT_RULE_REGISTRY[ct] = cls
+
+
+
+def _normalize_txt(type_txt: str) -> str:
+    return (type_txt or "").strip().upper()
+
+def resolve_constraint_type(type_txt: str) -> "ConstraintType":
+    """
+    Convert UI Type cell text into a ConstraintType.
+    Raises ValueError for unknown types.
+    """
+    t = _normalize_txt(type_txt).strip().upper()
+    if t in ("LINEAR",):
+        return ConstraintType.LINEAR
+    if t in ("RELAX_EXP", "RELAX", "DECAY", "EXP_DECAY"):
+        return ConstraintType.RELAX_EXP
+    raise ValueError(f"Unknown constraint type '{type_txt}'")
+
+def row_to_rule(
+    *,
+    target_pref: "ParamRef",
+    type_txt: str,
+    driver_txt: str,
+    expr_txt: str,
+    enabled: bool = True,
+) -> Optional["ConstraintRule"]:
+    """
+    Convert a LinkManagerDialog row text into a concrete ConstraintRule.
+
+    This function:
+      - normalizes & resolves ConstraintType
+      - call appropriate create_rule of a ConstraintRule subclass
+      - returns a ConstraintRule instance or None (meaning 'remove constraint').
+
+    """
+    if target_pref is None:
+        raise ValueError("row_to_rule requires target_pref")
+
+    expr = (expr_txt or "").strip()
+    if expr == "":
+        return None  # interpret empty Expr as "no constraint"
+
+    ct = resolve_constraint_type(type_txt)
+
+    rule_cls = CONSTRAINT_RULE_REGISTRY.get(ct)
+    if rule_cls is None:
+        raise ValueError(f"No class registered for {ct!r}")
+
+    create_rule = getattr(rule_cls, "create_rule", None)
+    if callable(create_rule):
+        # Parse driver_pref (may be None/empty)
+        driver_pref = None
+        if driver_txt and str(driver_txt).strip():
+            try:
+                driver_pref = txt_to_pref(driver_txt)
+            except Exception:
+                driver_pref = None
+        
+        rule = create_rule(
+            target_pref=target_pref,
+            driver_pref=driver_pref,
+            expr_txt=expr,
+            enabled=enabled,
+        )
+        return rule
+    else:
+        raise ValueError(f"ConstraintRule class {rule_cls.__name__} has no create_rule method")
 
 @dataclass
 class ConstraintValidationError:
@@ -57,8 +180,8 @@ class ConstraintRule(ABC):
     Abstract base class for all constraint rules.
     
     A constraint rule defines a mathematical relationship between a target parameter
-    and optionally a driver parameter. Rules can be validated, evaluated, and applied
-    to lmfit Parameter objects.
+    and optionally a driver parameter. Rules can be validated and applied to lmfit
+    Parameter objects.
     """
     
     enabled: bool = True
@@ -67,7 +190,24 @@ class ConstraintRule(ABC):
     @abstractmethod
     def constraint_type(self) -> ConstraintType:
         """Return the type of this constraint."""
-        pass
+        raise NotImplementedError
+
+    def rule_to_expr(self) -> str:
+        """Optional: return a canonical RHS expression suitable for the UI."""
+        return ""
+
+    @classmethod
+    @abstractmethod
+    def create_rule(
+        cls,
+        *,
+        target_pref: "ParamRef",
+        driver_pref: Optional["ParamRef"],
+        expr_txt: str,
+        enabled: bool = True,
+    ) -> "ConstraintRule":
+        """Create a rule instance from the LinkManagerDialog row cells."""
+        raise NotImplementedError
     
     @abstractmethod
     def validate(
@@ -91,73 +231,57 @@ class ConstraintRule(ABC):
         Returns:
             List of error messages (empty if valid)
         """
-        pass
-    
-    @abstractmethod
-    def evaluate(
-        self,
-        target_peak: Peak,
-        target_pref: ParamRef,
-        driver_peak: Optional[Peak],
-        driver_pref: Optional[ParamRef],
-        slice_states: Dict[int, Any]
-    ) -> float:
-        """
-        Evaluate the constraint to compute target value.
-        
-        Args:
-            target_peak: Peak object for target parameter
-            target_pref: ParamRef for target parameter
-            driver_peak: Peak object for driver parameter (if any)
-            driver_pref: ParamRef for driver parameter (if any)
-            slice_states: Dict mapping slice_id → SliceFitState
-        
-        Returns:
-            Computed value for target parameter in its native units
-        """
-        pass
+        raise NotImplementedError
     
     @abstractmethod
     def apply_to_lmfit(
         self,
         params,
         target_pref: ParamRef,
-        evaluated_value: float
+        driver_peak: Optional[Peak],
+        slice_states: Dict[int, Any]
     ) -> None:
         """
-        Apply constraint to an lmfit Parameters object.
+        Apply constraint to lmfit Parameters.
+        
+        For same-slice constraints: set Parameter.expr (lmfit evaluates)
+        For cross-slice constraints: compute value and freeze (vary=False)
         
         Args:
             params: lmfit.Parameters instance
             target_pref: ParamRef for target parameter
-            evaluated_value: Pre-computed value from evaluate()
+            driver_peak: Peak object for driver (needed for cross-slice computation)
+            slice_states: Dict mapping slice_id → SliceFitState
         """
-        pass
+        raise NotImplementedError
 
 
 class LinearConstraint(ConstraintRule):
     """
     Linear constraint: target = a * driver + b
     
-    If driver_pref is None, the constraint is a fixed value: target = b
+    A driver parameter is required. For numeric constraints, use PeakTable fix flags instead.
     """
     
     def __init__(
         self,
+        *,
         target_pref: ParamRef,
-        driver_pref: Optional[ParamRef] = None,
+        driver_pref: ParamRef,
         a: float = 1.0,
         b: float = 0.0,
-        enabled: bool = True
+        enabled: bool = True,
+        expr_txt: str = "",
     ):
         """
         Initialize a linear constraint.
         
         Args:
             target_pref: Parameter being constrained
-            driver_pref: Parameter driving the constraint (optional)
+            driver_pref: Parameter driving the constraint (REQUIRED)
             a: Multiplicative coefficient
             b: Additive offset
+            expr_txt: Expression text (for display/serialization)
             enabled: Whether this constraint is active
         """
         self.target_pref = target_pref
@@ -165,10 +289,217 @@ class LinearConstraint(ConstraintRule):
         self.a = float(a)
         self.b = float(b)
         self.enabled = bool(enabled)
+        self.expr_txt = str(expr_txt or "")
     
     @property
     def constraint_type(self) -> ConstraintType:
         return ConstraintType.LINEAR
+#
+    #@property
+    #def expr(self) -> str:
+    #    """Canonical RHS expression for UI display."""
+    #    return self.rule_to_expr()
+#   
+    @staticmethod
+    def parse_numeric_mult(txt: str) -> Tuple[float, str]:
+        """Return (a, driver_txt) from strings like '-s1_p0_amp', '2*s1_p0_amp', '2*0.5*s1_p0_amp'."""
+        t = (txt or "").strip().replace(" ", "")
+        if not t:
+            raise ValueError("Empty driver expression")
+
+        sign = 1.0
+        if t.startswith("+"):
+            t = t[1:]
+        elif t.startswith("-"):
+            sign = -1.0
+            t = t[1:]
+
+        if "*" not in t:
+            if _is_float(t):
+                raise ValueError("Numeric-only RHS is a fixed value; do not treat it as a driver")
+            if t and t[0].isdigit():
+                raise ValueError("Expected '*' between numeric factor and driver, e.g. '2*s0_p0_amp'")
+            return sign * 1.0, t
+
+        factors = [f for f in t.split("*") if f]
+        number = sign * 1.0
+        driver_txt: Optional[str] = None
+        for f in factors:
+            if _is_float(f):
+                number *= float(f)
+            else:
+                if driver_txt is not None:
+                    raise ValueError(f"Multiple driver tokens found in '{txt}'")
+                driver_txt = f
+        if not driver_txt:
+            raise ValueError(f"No driver token found in '{txt}'")
+        return float(number), driver_txt
+
+    @staticmethod
+    def parse_rhs(UI_rhs_raw: str) -> Tuple[float, float, str]:  # driver_txt no longer Optional
+        """
+        rhs = right-hand side
+        Parse forms like:
+            "s15_p1_amp<br>"
+            "-s15_p1_amp<br>"
+            "2*s15_p1_amp<br>"
+            "s15_p1_amp + 1<br>"
+            "2*s15_p1_amp - 0.5<br>"
+        Do not support:
+            "1" (numeric only - use PeakTable fix flags)
+            "2s15_p1_amp + 1"  (missing * between numberic factor and paramRef)
+        """
+        rhs = (UI_rhs_raw or "").strip()
+        if _is_float(rhs):
+            raise ValueError("Numeric-only constraint not allowed. Use PeakTable fix flags for fixed values")
+
+        rhs = rhs.replace(" ", "")
+        split_i = -1
+        for i, ch in enumerate(rhs[1:], start=1): #start = 1 to match with string index of rhs
+            if ch in "+-":
+                split_i = i
+                break
+
+        b = 0.0
+        a_driver = rhs
+        if split_i != -1:
+            left, right = rhs[:split_i], rhs[split_i:]
+            # Prefer parsing numeric intercept on either side.
+            if _is_float(right):
+                b = float(right)
+                a_driver = left
+            elif _is_float(left):
+                b = float(left)
+                a_driver = right
+            else:
+                # assume intercept absent; treat entire RHS as driver term
+                b = 0.0
+                a_driver = rhs
+
+        a, driver_txt = LinearConstraint.parse_numeric_mult(a_driver)
+        if not driver_txt:
+            raise ValueError("A driver is required. Numeric constraint should be done using the PeakTable and fix flags")
+        
+        return float(a), float(b), driver_txt  # driver_txt guaranteed non-None
+    
+    @staticmethod
+    def parse_kv(s: str) -> dict:
+        out = {}
+        for chunk in s.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=" not in chunk:
+                raise ValueError(f"Expected key=value in '{chunk}'")
+            k, v = chunk.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            # don't force to float yet; some can be symbolic (T_name)
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+        return out
+    
+    @staticmethod
+    def parse_UItext(UI_txt: str) -> Tuple[float, float, str]:  # driver_txt no longer Optional
+        """
+        Parse forms like:
+            those supported by parse_rhs(), plus:
+            "s14_p2_amp = 2*s15_p1_amp + 1"
+            "a=0.95, b=0.02, driver=s15_p1_amp<br>"
+        """
+        t = (UI_txt or "").strip()
+        if not t:
+            raise ValueError("Empty expression")
+
+        # KV style: 'a=..., b=..., driver=...'
+        if ("driver=" in t) or ("a=" in t) or ("b=" in t):
+            kv = LinearConstraint.parse_kv(t)
+            a = float(kv.get("a", 1.0))
+            b = float(kv.get("b", 0.0))
+            driver_txt = kv.get("driver", None)
+            if not driver_txt or str(driver_txt).strip() == "":
+                raise ValueError("A driver is required. Numeric constraint should be done using the PeakTable and fix flags")
+            driver_txt = str(driver_txt).strip()
+            return a, b, driver_txt
+
+        # Full assignment: lhs = rhs
+        if "=" in t and not t.startswith("="):
+            _lhs, rhs = t.split("=", 1)
+            return LinearConstraint.parse_rhs(rhs.strip())
+
+        # RHS only
+        return LinearConstraint.parse_rhs(t)
+    
+    def UItext_to_expr(UItext) -> str:
+        """Convert UI expression text into standard RHS expression for UI display and lmfit."""
+        a, b, drv = LinearConstraint.parse_UItext(UItext)
+        # drv is guaranteed to be non-empty string at this point
+
+        if a == 1.0 and b == 0.0:
+            return drv
+        if a == 1.0:
+            return f"{drv}+{b}" if b >= 0 else f"{drv}-{abs(b)}"
+        if b == 0.0:
+            return f"{a}*{drv}"
+        return f"{a}*{drv}+{b}" if b >= 0 else f"{a}*{drv}-{abs(b)}"
+    
+    def rule_to_expr(self) -> str:
+        """Safely call expr_txt or construct expr from a b driver."""
+        # Prefer canonical stored text, but canonicalize defensively.
+        
+        s = (self.expr_txt or "").strip()
+        if s:
+            return self.expr_txt
+
+        drv = fmt_pref(self.driver_pref)
+        a = float(self.a)
+        b = float(self.b)
+
+        if a == 1.0 and b == 0.0:
+            return drv
+        if a == 1.0:
+            return f"{drv}+{b}" if b >= 0 else f"{drv}-{abs(b)}"
+        if b == 0.0:
+            return f"{a}*{drv}"
+        return f"{a}*{drv}+{b}" if b >= 0 else f"{a}*{drv}-{abs(b)}"
+
+    @classmethod
+    def create_rule(
+        cls,
+        *,
+        target_pref: ParamRef,
+        driver_pref: Optional[ParamRef],
+        expr_txt: str,  # Changed from UI_txt to match signature
+        enabled: bool = True,
+    ) -> "ConstraintRule":
+        """Create a LinearConstraint from UI driver + expr cells."""
+        a, b, driver_txt = cls.parse_UItext(expr_txt)
+        canonical_expr = cls.UItext_to_expr(expr_txt)
+        
+        # Parse driver from expression
+        drv_from_expr = txt_to_pref(driver_txt)  # driver_txt is guaranteed non-None
+
+        # Validate driver consistency
+        if driver_pref is not None:
+            if not pref_equal(driver_pref, drv_from_expr):
+                raise ValueError(
+                    f"Driver mismatch: driver cell '{fmt_pref(driver_pref)}' "
+                    f"!= expr driver '{fmt_pref(drv_from_expr)}'"
+                )
+            final_driver = driver_pref
+        else:
+            final_driver = drv_from_expr
+
+        return cls(
+            target_pref=target_pref,
+            driver_pref=final_driver,
+            a=a,
+            b=b,
+            enabled=enabled,
+            expr_txt=canonical_expr
+        )
     
     def validate(
         self,
@@ -178,135 +509,87 @@ class LinearConstraint(ConstraintRule):
         driver_pref: Optional[ParamRef],
         slice_states: Dict[int, Any]
     ) -> List[str]:
-        """Validate that driver exists if required."""
+        """Validate semantic preconditions: driver exists and coefficients are finite."""
         errors = []
         
-        if self.driver_pref is not None and driver_peak is None:
+        # Driver must exist for LinearConstraint (semantic check)
+        if driver_peak is None:
             errors.append(
-                f"Linear constraint on {self._fmt_pref(target_pref)}: "
-                f"driver {self._fmt_pref(self.driver_pref)} not found"
+                f"Linear constraint on {fmt_pref(target_pref)}: "
+                f"driver peak s{self.driver_pref.slice_id}_p{self.driver_pref.peak_id} not found"
             )
         
         # Validate coefficients
         if not np.isfinite(self.a):
             errors.append(
-                f"Linear constraint on {self._fmt_pref(target_pref)}: "
+                f"Linear constraint on {fmt_pref(target_pref)}: "
                 f"coefficient a={self.a} is not finite"
             )
         
         if not np.isfinite(self.b):
             errors.append(
-                f"Linear constraint on {self._fmt_pref(target_pref)}: "
+                f"Linear constraint on {fmt_pref(target_pref)}: "
                 f"offset b={self.b} is not finite"
             )
         
         return errors
     
-    def evaluate(
-        self,
-        target_peak: Peak,
-        target_pref: ParamRef,
-        driver_peak: Optional[Peak],
-        driver_pref: Optional[ParamRef],
-        slice_states: Dict[int, Any]
-    ) -> float:
-        """
-        Evaluate: target = a * driver_value + b
-        If no driver, return b (fixed value).
-        """
-        if self.driver_pref is None or driver_peak is None:
-            return float(self.b)
-        
-        # Extract driver parameter value from driver_peak
-        driver_value = self._get_peak_value(driver_peak, self.driver_pref.name)
-        
-        result = self.a * driver_value + self.b
-        return float(result)
-    
     def apply_to_lmfit(
         self,
         params,
         target_pref: ParamRef,
-        evaluated_value: float
+        driver_peak: Peak,
+        slice_states: Dict[int, Any],
+        enabled: bool = True,
+        vary: bool = True
     ) -> None:
         """
         Apply linear constraint to lmfit.
         
-        For LINEAR constraints with a driver: set vary=False and expr='...'
-        For fixed values (no driver): set value and vary=False
+        Same-slice: set Parameter.expr = "a*driver_key + b" and Vary=True
+        Cross-slice: Sequential -> compute value and freeze. Joint -> use expr and Vary=True
         """
-        param_key = self._pref_to_lmfit_key(target_pref)
-        
-        if param_key not in params:
-            return
-        
-        param = params[param_key]
-        
-        if self.driver_pref is None:
-            # Fixed value constraint
-            param.value = evaluated_value
-            param.vary = False
-        else:
-            # Expression-based constraint: build expression string
-            driver_key = self._pref_to_lmfit_key(self.driver_pref)
-            
-            # Build expression: a*driver_key + b
-            if self.a == 1.0 and self.b == 0.0:
-                expr = driver_key
-            elif self.a == 1.0:
-                expr = f"{driver_key} + {self.b}"
-            elif self.b == 0.0:
-                expr = f"{self.a} * {driver_key}"
-            else:
-                expr = f"{self.a} * {driver_key} + {self.b}"
-            
-            param.expr = expr
-            param.vary = False
-    
-    @staticmethod
-    def _get_peak_value(peak: Peak, param_name: str) -> float:
-        """Extract parameter value from Peak object."""
-        param_name = str(param_name).lower().strip()
-        
-        if param_name == "pos":
-            return float(peak.pos)
-        elif param_name == "amp":
-            return float(peak.amp)
-        elif param_name == "lor":
-            return float(peak.lor_hz)
-        elif param_name == "gauss":
-            return float(peak.gauss_disp)
-        else:
-            raise ValueError(f"Unknown peak parameter: {param_name}")
-    
-    @staticmethod
-    def _pref_to_lmfit_key(pref: ParamRef) -> str:
-        """Convert ParamRef to lmfit parameter key."""
-        return f"s{int(pref.slice_id)}_p{int(pref.peak_id)}_{str(pref.name)}"
-    
-    @staticmethod
-    def _fmt_pref(pref: ParamRef) -> str:
-        """Format ParamRef for display."""
-        return f"s{pref.slice_id}_p{pref.peak_id}_{pref.name}"
+        if enabled and vary == True:
+            param_key = fmt_pref(target_pref)
 
+            if param_key not in params:
+                return
+
+            param = params[param_key]
+            driver_key = fmt_pref(self.driver_pref)
+
+            # Check if driver is in same slice (can use algebraic expr)
+            if int(self.driver_pref.slice_id) == int(target_pref.slice_id):
+                # Same-slice: use Parameter.expr
+                expr_lmfit = self.rule_to_expr()
+                param.set(expr=expr_lmfit)
+
+        else:
+            # Cross-slice: compute value and freeze
+            if driver_peak is None:
+                return  # validation should have caught this
+            driver_value = _get_peak_value(driver_peak, self.driver_pref.name)
+            computed_value = float(self.a * driver_value + self.b)
+            param.set(value=computed_value, expr=expr_lmfit, vary=False)
 
 class RelaxDecayConstraint(ConstraintRule):
     """
     Relaxation exponential constraint: target = driver * A * exp(-t / T) + C
     
     Used for fitting relaxation curves where target values depend on acquisition time.
-    Time can be supplied explicitly or read from a time registry.
+    Time can be supplied explicitly or read from slice_states.
     """
     
     def __init__(
         self,
         target_pref: ParamRef,
         driver_pref: ParamRef,
-        T_seconds: float,
+        T_seconds: float = None,
         A: float = 1.0,
         C: float = 0.0,
         time_seconds: Optional[float] = None,
         T_name: Optional[str] = None,
+        expr_txt: str = "",
         enabled: bool = True
     ):
         """
@@ -315,25 +598,182 @@ class RelaxDecayConstraint(ConstraintRule):
         Args:
             target_pref: Parameter being constrained
             driver_pref: Parameter driving the decay
-            T_seconds: Decay time constant (seconds)
+            T_seconds: Decay time constant (seconds) can be None if T_name used
             A: Amplitude multiplicative factor
             C: Baseline offset
             time_seconds: Explicit time value (overrides T_name lookup)
-            T_name: Name of time constant in seed registry (optional)
+            T_name: Name of time constant can be None if T_seconds used
             enabled: Whether this constraint is active
         """
         self.target_pref = target_pref
         self.driver_pref = driver_pref
-        self.T_seconds = float(T_seconds)
+        self.T_seconds = float(T_seconds) if T_seconds is not None else None
         self.A = float(A)
         self.C = float(C)
         self.time_seconds = float(time_seconds) if time_seconds is not None else None
         self.T_name = T_name
         self.enabled = bool(enabled)
+        self.expr_txt = str(expr_txt or "")
     
     @property
     def constraint_type(self) -> ConstraintType:
         return ConstraintType.RELAX_EXP
+    
+    @classmethod
+    def parse_rhs(UI_rhs_raw: str) -> Dict: #
+        """
+            "s15_p1_amp*1*exp(-0.1/T_name + 2)<br>"
+            return dict with keys of A, driver_txt, C, t_override, T_name, T_number
+        """
+        out = {}
+        txt = UI_rhs_raw.strip().lower()   
+        exp_idx = txt.find("exp(")
+        if exp_idx == -1:
+            raise ValueError(f"Malformed exponential constraint expression: '{UI_rhs_raw}'")
+
+        left = txt[:exp_idx] # Left of *exp
+        right = txt[exp_idx+1:]  # Right of exp(...) to end. ignore the '*'
+
+        # parse left side to get A and driver_txt
+        A, driver_txt = LinearConstraint.parse_numeric_mult(left.replace("*", "").strip())
+        
+        # parse right side to get t, T_name or T, C
+        s = right.replace("exp(", "").replace(")", "")
+        C = 0.0
+        idx_plus = s.find("+", 1)
+        idx_minus = s.find("-", 1)
+        indices = [i for i in (idx_plus, idx_minus) if i != -1]
+        i = min(indices) if indices else -1
+        if i != -1:
+            main = s[:i].replace(" ", "")
+            c_part = s[i:].replace(" ", "")
+            C = float(c_part)
+        else:
+            main = s
+        # main should look like: -0.1/T_name   or  -0.1/0.035
+        if not main.startswith("-"):
+            raise ValueError(f"Expected '-' at start of exponential argument in '{UI_rhs_raw}'")
+        if main.startswith("-"):
+            main_k = main
+        if "/" not in main_k:
+            raise ValueError(f"Expected form like '-k/T_name' in '{UI_rhs_raw}'")
+        k_part, T_part = main_k.split("/", 1)
+        k_val = float(k_part)
+        # T_part can be numeric or name
+        if _is_float(T_part):
+            # numeric T
+            # original exp() used "T"
+            out["T"] = float(T_part)
+        else:
+            out["T_name"] = T_part
+
+        out = {"A": A, "driver_txt": driver_txt, "C": C, "t_override": k_val, "T_name": T_part, "T": float(T_part) if _is_float(T_part) else None}
+
+        return out
+    
+    @classmethod
+    def parse_UItext(UI_txt) -> Dict: #keys are A, driver_txt, C, t_override, T_name, T_number
+        """Parse the expression string into components.
+            similar to parse_rhs plus
+            "exp(A=1.2, T=0.035, C=0)<br>"
+            "exp(A=1.2, T_name=Tglobal, C=0)<br>"
+            "s14_p2_amp = s15_p1_amp*1*[exp(-0.1/T_name) + 2]<br>"
+            "s14_p2_amp = exp(A=1.2, T_name=Tglobal, C=0)
+            return dict with keys of A, driver_txt, C, t_override, T_name, T_number
+        """
+        out = {}
+        t = UI_txt.strip()
+                # Case 1: pure kv-style exp(...)
+                        # 1) KV style: "exp(A=1.2, T=0.035, C=0)" --> return dict with A,T_seconds,T_name,C
+                # 1) rhs, e.g "2*s15_p1_amp + 1"
+        if "=" not in t: #no assignment, just rhs
+            out = RelaxDecayConstraint.parse_rhs(t)
+            return out
+
+        # 2) full assignment: lhs = rhs, e.g "s14_p2_amp = 2*s15_p1_amp + 1"
+
+        if "=" in t and not t.startswith("="): #detect full assignment
+            lhs, rhs = t.split("=", 1)
+            rhs = rhs.strip() #2*s15_p1_amp + 1
+            out = RelaxDecayConstraint.parse_rhs(rhs)
+            return out
+
+        # 3) dict-like assignment: A=1, C=2, driver=s14_p2_amp
+
+        if "driver=" in t or "A=" in t or "C=" in t:
+            kv = LinearConstraint.parse_kv(t)
+            A = float(kv.pop("A", 1.0))
+            C = float(kv.pop("C", 0.0))
+            driver_txt = str(kv.pop("driver", ""))
+            t_override = str(kv.pop("t", ""))
+            T_name = str(kv.pop("T_name", None))
+            T_number = kv.pop("T", None)
+            out = {"A": A, "driver_txt": driver_txt, "C": C, "t_override": t_override, "T_name": T_name, "T_number": float(T_number) if T_number is not None else None}
+            return out
+
+
+    @classmethod
+    def create_rule(
+        cls,
+        *,
+        target_pref: ParamRef,
+        driver_pref: Optional[ParamRef],
+        expr_txt: str,
+        enabled: bool = True,
+    ) -> "ConstraintRule":
+        
+        """Create a RelaxDecayConstraint from UI driver + expr cells."""
+        out = cls.parse_UItext(expr_txt)
+        A = float(out.get("A", 1.0))
+        driver_txt = out.get("driver_txt", None)
+        C = out.get("C", 0.0)
+        t_override = out.get("t_override", None)
+        T_name = out.get("T_name", None)
+        T_number = out.get("T_number", None)
+
+        drv_from_expr: Optional[ParamRef] = None
+        if driver_txt:
+            drv_from_expr = txt_to_pref(str(driver_txt).strip())
+
+        if driver_pref is not None and drv_from_expr is not None:
+            if not pref_equal(driver_pref, drv_from_expr):
+                raise ValueError(
+                    f"Driver mismatch: driver cell '{cls._fmt_pref(driver_pref)}' "
+                    f"!= expr driver '{cls._fmt_pref(drv_from_expr)}'"
+                )
+        if driver_pref is None:
+            driver_pref = drv_from_expr
+        if driver_pref is None:
+            raise ValueError("RELAX_EXP requires a driver parameter")
+
+        # time override is required for evaluation; store as float if possible
+        t_s: Optional[float] = None
+        if t_override not in (None, ""):
+            t_s = float(t_override)
+
+        # Build a canonical expr for display (and optional debugging)
+        canonical = ""
+        drv_txt = cls._fmt_pref(driver_pref)
+        if T_number is not None:
+            expr_txt = f"{A}*{driver_txt}*exp(-{t_override}/{T_number}) + {C}"
+            if A == 1 and C == 0:
+                expr_txt = f"{driver_txt}*exp(-{t_override}/{T_number})"
+        elif T_name is not None:
+            expr_txt = f"{A}*{driver_txt}*exp(-{t_override}/{T_name}) + {C}"
+            if A == 1 and C == 0:
+                expr_txt = f"{driver_txt}*exp(-{t_override}/{T_name})"
+
+        rule = RelaxDecayConstraint(
+            target_pref=target_pref,
+            driver_pref=driver_pref if driver_pref is not None else None,
+            T_seconds=T_number,
+            A=A,
+            C=C,
+            time_seconds=t_override,
+            T_name=T_name,
+            enabled=enabled
+        )
+        return rule
     
     def validate(
         self,
@@ -343,81 +783,79 @@ class RelaxDecayConstraint(ConstraintRule):
         driver_pref: Optional[ParamRef],
         slice_states: Dict[int, Any]
     ) -> List[str]:
-        """Validate exponential constraint parameters."""
+        """Validate exponential constraint semantic preconditions."""
         errors = []
         
+        # Driver must exist
         if driver_peak is None or driver_pref is None:
             errors.append(
-                f"Exponential constraint on {self._fmt_pref(target_pref)}: "
-                f"driver {self._fmt_pref(self.driver_pref)} not found"
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
+                f"driver peak s{self.driver_pref.slice_id}_p{self.driver_pref.peak_id} not found"
             )
         
-        # Validate T
-        if self.T_seconds <= 0.0:
-            errors.append(
-                f"Exponential constraint on {self._fmt_pref(target_pref)}: "
-                f"time constant T={self.T_seconds} must be positive"
-            )
+        # Validate T (if numeric) must be positive
+        if self.T_seconds is not None:
+            try:
+                T_val = float(self.T_seconds)
+                if T_val <= 0.0:
+                    errors.append(
+                        f"Exponential constraint on {fmt_pref(target_pref)}: "
+                        f"time constant T={T_val} must be positive"
+                    )
+            except (ValueError, TypeError):
+                errors.append(
+                    f"Exponential constraint on {fmt_pref(target_pref)}: "
+                    f"time constant T={self.T_seconds} is not a valid number"
+                )
         
-        # Validate time
+        # Check time availability (either explicit or from slice_states)
         if self.time_seconds is None and self.T_name is None:
-            errors.append(
-                f"Exponential constraint on {self._fmt_pref(target_pref)}: "
-                f"no time_seconds or T_name provided"
-            )
+            # Try to get from slice_states as fallback
+            slice_id = int(target_pref.slice_id)
+            state = slice_states.get(slice_id)
+            t_available = False
+            if state is not None:
+                t_f1 = getattr(state, 't_f1', None)
+                if t_f1 is not None and hasattr(t_f1, '__getitem__'):
+                    try:
+                        _ = float(t_f1[slice_id])
+                        t_available = True
+                    except (IndexError, TypeError, ValueError):
+                        pass
+            
+            if not t_available:
+                errors.append(
+                    f"Exponential constraint on {fmt_pref(target_pref)}: "
+                    f"no time value available (no time_seconds or T_name, and slice_states has no t_f1)"
+                )
         
         if self.time_seconds is not None and self.time_seconds < 0.0:
             errors.append(
-                f"Exponential constraint on {self._fmt_pref(target_pref)}: "
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
                 f"time_seconds={self.time_seconds} must be non-negative"
             )
         
         # Validate coefficients
         if not np.isfinite(self.A):
             errors.append(
-                f"Exponential constraint on {self._fmt_pref(target_pref)}: "
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
                 f"amplitude A={self.A} is not finite"
             )
         
         if not np.isfinite(self.C):
             errors.append(
-                f"Exponential constraint on {self._fmt_pref(target_pref)}: "
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
                 f"baseline C={self.C} is not finite"
             )
         
         return errors
     
-    def evaluate(
-        self,
-        target_peak: Peak,
-        target_pref: ParamRef,
-        driver_peak: Optional[Peak],
-        driver_pref: Optional[ParamRef],
-        slice_states: Dict[int, Any]
-    ) -> float:
-        """
-        Evaluate: target = driver * A * exp(-t / T) + C
-        """
-        if driver_peak is None or driver_pref is None:
-            raise ValueError("Driver peak required for exponential constraint")
-        
-        # Get time value
-        t = self._get_time_value(slice_states)
-        
-        # Extract driver parameter value
-        driver_value = LinearConstraint._get_peak_value(driver_peak, self.driver_pref.name)
-        
-        # Compute: driver * A * exp(-t / T) + C
-        exp_term = np.exp(-t / self.T_seconds)
-        result = driver_value * self.A * exp_term + self.C
-        
-        return float(result)
-    
     def apply_to_lmfit(
         self,
         params,
         target_pref: ParamRef,
-        evaluated_value: float
+        driver_peak: Optional[Peak],
+        slice_states: Dict[int, Any]
     ) -> None:
         """
         Apply exponential constraint to lmfit.
@@ -425,34 +863,64 @@ class RelaxDecayConstraint(ConstraintRule):
         For exponential constraints, set the parameter to fixed value
         (expression building would be complex; evaluation is done once upfront).
         """
-        param_key = LinearConstraint._pref_to_lmfit_key(target_pref)
+        param_key = fmt_pref(target_pref)
         
         if param_key not in params:
             return
         
+        if driver_peak is None:
+            return  # validation should have caught this
+        
+        # Get time value
+        t = self._get_time_value(target_pref, slice_states)
+        
+        # Get T value (numeric or from registry)
+        T = self._get_T_value(slice_states)
+        
+        # Extract driver parameter value
+        driver_value = _get_peak_value(driver_peak, self.driver_pref.name)
+        
+        # Compute: driver * A * exp(-t / T) + C
+        exp_term = np.exp(-t / T)
+        computed_value = float(driver_value * self.A * exp_term + self.C)
+        
+        # Freeze parameter
         param = params[param_key]
-        param.value = evaluated_value
+        param.value = computed_value
         param.vary = False
     
-    def _get_time_value(self, slice_states: Dict[int, Any]) -> float:
-        """Get time value from explicit value or from seed registry."""
+    def _get_time_value(self, target_pref: ParamRef, slice_states: Dict[int, Any]) -> float:
+        """Get time value from explicit value or from slice_states."""
         if self.time_seconds is not None:
             return float(self.time_seconds)
         
+        # Try to get from slice_states t_f1 array
+        slice_id = int(target_pref.slice_id)
+        state = slice_states.get(slice_id)
+        if state is not None:
+            t_f1 = getattr(state, 't_f1', None)
+            if t_f1 is not None and hasattr(t_f1, '__getitem__'):
+                try:
+                    return float(t_f1[slice_id])
+                except (IndexError, TypeError):
+                    pass
+        
+        raise ValueError(f"No time value available for slice {slice_id}")
+    
+    def _get_T_value(self, slice_states: Dict[int, Any]) -> float:
+        """Get T value from numeric T_seconds or from T_name registry."""
+        if self.T_seconds is not None:
+            return float(self.T_seconds)
+        
         if self.T_name is not None:
-            # Would lookup from MainWindow._TSeedRegistry or similar
+            # Lookup from MainWindow._TSeedRegistry (would need to pass in)
             # For now, raise to indicate missing implementation
             raise NotImplementedError(
-                f"T_name lookup for '{self.T_name}' not yet implemented; "
-                f"use explicit time_seconds instead"
+                f"T_name lookup for '{self.T_name}' requires registry access; "
+                f"use explicit T_seconds instead"
             )
         
-        raise ValueError("No time value available for exponential constraint")
-    
-    @staticmethod
-    def _fmt_pref(pref: ParamRef) -> str:
-        """Format ParamRef for display."""
-        return f"s{pref.slice_id}_p{pref.peak_id}_{pref.name}"
+        raise ValueError("No T value available for exponential constraint")
 
 
 class ConstraintRuleFactory:
@@ -460,8 +928,6 @@ class ConstraintRuleFactory:
     Factory for creating constraint rules from serialized representations.
     Useful for loading/saving constraints to file and creating rules from user input.
     """
-    def _fmt_pref(self, pref: ParamRef) -> str:
-        return f"s{pref.slice_id}_p{pref.peak_id}_{pref.name.lower()}"
     
     @staticmethod
     def parse_row_to_constraint(*, target, type_txt: str, driver, expr_txt: str):
@@ -473,7 +939,7 @@ class ConstraintRuleFactory:
         3) else → linear implicit
         """
         if expr_txt.startswith("="):
-            return ConstraintRuleFactory.parse_expr(target, expr_txt.lstrip("="))
+            return ConstraintRuleFactory.parse_UItext(target, expr_txt.lstrip("="))
 
         if type_txt.upper() == "RELAX_EXP":
             return ConstraintRuleFactory.parse_inline_or_kv(target, expr_txt)
@@ -487,266 +953,8 @@ class ConstraintRuleFactory:
                 enabled=True,
             )
 
-        return ConstraintRuleFactory.parse_expr(target, expr_txt)
+        return ConstraintRuleFactory.parse_UItext(target, expr_txt)
 
-    @staticmethod
-    def parse_expr(target: ParamRef, text: str) -> ConstraintRule:
-        t = text.strip()
-        # 1) full assignment: lhs = rhs
-        if "=" in t and not t.startswith("=") and not t.lower().startswith("exp("):
-            lhs, rhs = t.split("=", 1)
-            lhs_pref = ConstraintRuleFactory.parse_pref(lhs.strip())
-            if not _pref_equal(lhs_pref, target):
-                raise ValueError(
-                     f"LHS '{lhs.strip()}' does not match row target '{_fmt_pref(target)}'"
-                )
-            rhs = rhs.strip()
-            if ConstraintRuleFactory.detect_driver_exp(rhs):
-                return ConstraintRuleFactory.parse_driver_exp(target, rhs)
-            return ConstraintRuleFactory.parse_inline_or_kv(target, "=" + rhs)
-
-        return ConstraintRuleFactory.parse_inline_or_kv(target, t)
-
-    @staticmethod
-    def parse_inline_or_kv(target: ParamRef, t: str) -> ConstraintRule:
-        if t.lower().startswith("exp(") and t.endswith(")"):
-            args_raw = t[t.find("(")+1:-1]
-            args = ConstraintRuleFactory.parse_kv(args_raw)
-            norm = {}
-            for k, v in args.items():
-                if k == "A":
-                    norm["A"] = float(v)
-                elif k == "T":
-                    norm["T"] = float(v)
-                elif k == "T_name":
-                    norm["T_name"] = str(v)
-                elif k == "C":
-                    norm["C"] = float(v)
-                elif k == "t":
-                    norm["t_override"] = float(v)
-                else:
-                    norm[k] = v
-            if "T_name" in norm and "T" in norm:
-                norm.pop("T", None)
-            return RelaxDecayConstraint(
-                target_pref=target,
-                driver_pref=None,
-                T_seconds=norm.get("T", 1.0),
-                A=norm.get("A", 1.0),
-                C=norm.get("C", 0.0),
-                time_seconds=norm.get("t_override"),
-                T_name=norm.get("T_name"),
-                enabled=True,
-            )
-
-        if ConstraintRuleFactory.detect_driver_exp(t):
-            return ConstraintRuleFactory.parse_driver_exp(target, t)
-
-        if t.find("exp") == -1:
-            return ConstraintRuleFactory.parse_inline_linear(target, t.strip())
-
-        if "driver=" in t or "a=" in t or "b=" in t:
-            kv = ConstraintRuleFactory.parse_kv(t)
-            if "driver" not in kv:
-                raise ValueError("Linear KV form requires driver=...")
-            driver_pref = ConstraintRuleFactory.parse_pref(str(kv.pop("driver")))
-            a = float(kv.pop("a", 1.0))
-            b = float(kv.pop("b", 0.0))
-            return LinearConstraint(
-                target_pref=target,
-                driver_pref=driver_pref,
-                a=a,
-                b=b,
-                enabled=True,
-            )
-
-        raise ValueError("Unrecognized expression")
-
-    @staticmethod
-    def detect_driver_exp(txt: str) -> bool:
-        s = txt.strip()
-        exp_idx = s.lower().find("exp")
-        if exp_idx == -1:
-            return False
-        star_before = s.rfind("*", 0, exp_idx)
-        return star_before != -1
-
-    @staticmethod
-    def parse_driver_exp(target: ParamRef, expr: str) -> ConstraintRule:
-        txt = expr.strip()
-        exp_pos = txt.lower().find("exp(")
-        left = txt[:exp_pos].strip()
-        right = txt[exp_pos:].strip()
-        factors = [p.strip() for p in left.split("*") if p.strip()]
-        driver_pref = None
-        A_left = 1.0
-        for f in factors:
-            if ConstraintRuleFactory.is_float(f):
-                A_left *= float(f)
-            else:
-                if driver_pref is None:
-                    driver_pref = ConstraintRuleFactory.parse_pref(f)
-                else:
-                    raise ValueError(f"Too many non-numeric factors in '{left}'")
-        if driver_pref is None:
-            raise ValueError(f"Cannot find driver in '{expr}'")
-
-        if not right.lower().startswith("exp(") or not right.endswith(")"):
-            raise ValueError(f"Invalid exponential form '{expr}'")
-        inner = right[right.find("(")+1:-1].strip()
-        args = ConstraintRuleFactory.parse_exp_inside(inner)
-        args["A"] = float(args.get("A", 1.0)) * A_left
-
-        return RelaxDecayConstraint(
-            target_pref=target,
-            driver_pref=driver_pref,
-            T_seconds=args.get("T", 1.0),
-            A=args.get("A", 1.0),
-            C=args.get("C", 0.0),
-            time_seconds=args.get("t_override"),
-            T_name=args.get("T_name"),
-            enabled=True,
-        )
-
-    @staticmethod
-    def parse_exp_inside(inner: str) -> dict:
-        s = inner.replace(" ", "")
-        C = 0.0
-        if "+" in s[1:]:
-            main, c_part = s.split("+", 1)
-            C = float(c_part)
-        else:
-            main = s
-
-        if not main.startswith("-"):
-            main_k = main
-        else:
-            main_k = main[1:]
-
-        if "/" not in main_k:
-            raise ValueError(f"Expected form like '-k/T_name' in '{inner}'")
-        k_part, t_part = main_k.split("/", 1)
-        k_val = float(k_part)
-
-        out = {"A": 1.0, "C": C}
-        if ConstraintRuleFactory.is_float(t_part):
-            out["T"] = float(t_part)
-        else:
-            out["T_name"] = t_part
-        out["t_override"] = k_val
-        return out
-
-    @staticmethod
-    def parse_inline_linear(target: ParamRef, rhs: str) -> ConstraintRule:
-        txt = rhs.strip()
-        b = 0.0
-        driver_part = txt
-        plus_idx = txt.find("+")
-        minus_idx = txt.find("-", 1)
-
-        if plus_idx != -1:
-            driver_part = txt[:plus_idx].strip()
-            b_str = txt[plus_idx+1:].strip()
-            b = float(b_str)
-        elif minus_idx != -1:
-            driver_part = txt[:minus_idx].strip()
-            b_str = txt[minus_idx:].strip()
-            b = float(b_str)
-
-        if "*" in driver_part:
-            left, right = [p.strip() for p in driver_part.split("*", 1)]
-            if ConstraintRuleFactory.is_float(left) and not ConstraintRuleFactory.is_float(right):
-                a = float(left)
-                driver_pref = ConstraintRuleFactory.parse_pref(right)
-            elif ConstraintRuleFactory.is_float(right) and not ConstraintRuleFactory.is_float(left):
-                a = float(right)
-                driver_pref = ConstraintRuleFactory.parse_pref(left)
-            else:
-                raise ValueError(f"Cannot interpret '{driver_part}' as a * driver")
-        else:
-            a = 1.0
-            driver_pref = ConstraintRuleFactory.parse_pref(driver_part.strip())
-
-        return LinearConstraint(
-            target_pref=target,
-            driver_pref=driver_pref,
-            a=a,
-            b=b,
-            enabled=True,
-        )
-
-    @staticmethod
-    def parse_kv(s: str) -> dict:
-        out = {}
-        for chunk in s.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if "=" not in chunk:
-                raise ValueError(f"Expected key=value in '{chunk}'")
-            k, v = chunk.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            try:
-                out[k] = float(v)
-            except ValueError:
-                out[k] = v
-        return out
-
-    @staticmethod
-    def parse_pref(txt: str) -> ParamRef:
-        t = txt.strip()
-        parts = t.split("_")
-        if len(parts) < 3:
-            raise ValueError(f"Invalid ParamRef '{txt}' (expected sN_pM_name)")
-        try:
-            sid = int(parts[0].lstrip("sS"))
-            pid = int(parts[1].lstrip("pP"))
-        except Exception:
-            raise ValueError(f"Invalid ParamRef numbers in '{txt}'")
-
-        raw_name = "_".join(parts[2:]).strip().lower()
-
-        if raw_name in ("pos", "position"):
-            name = "pos"
-        elif raw_name in ("amp", "area", "amplitude", "integral", "integrals"):
-            name = "amp"
-        elif raw_name in ("lor", "lorentz", "lor_hz"):
-            name = "lor"
-        elif raw_name in ("gau", "gauss", "gaussian", "gauss_disp"):
-            name = "gauss"
-        else:
-            raise ValueError(f"Unknown param name '{raw_name}'")
-
-        return ParamRef(slice_id=sid, peak_id=pid, name=name)
-
-    @staticmethod
-    def is_float(s: str) -> bool:
-        try:
-            float(s)
-            return True
-        except Exception:
-            return False
-    
-    @staticmethod
-    def _fmt_exp_args(args: dict, driver: ParamRef) -> str:
-        """Format exponential constraint arguments for display."""
-        drv_txt = ConstraintRuleFactory._fmt_pref(driver) if driver else "(None)"
-        A = args.get("A", 1.0)
-        k = args.get("t_override", 1.0)
-        C = args.get("C", 0.0)
-        denom = args.get("T_name") or args.get("T", "?")
-        return f"{drv_txt}*{A:g}*exp(-{k:g}/{denom}+{C:g})"
-    
-    @staticmethod
-    def _fmt_linear_args(args: dict, driver: ParamRef) -> str:
-        """Format linear constraint arguments for display."""
-        drv_txt = ConstraintRuleFactory._fmt_pref(driver) if driver else "(None)"
-        a = args.get("a", 1.0)
-        b = args.get("b", 0.0)
-        if b == 0:
-            return f"{a:g}*{drv_txt}"
-        return f"{a:g}*{drv_txt} + {b:g}"
 
     @staticmethod
     def create_linear_constraint(target_pref, driver_pref, a=1.0, b=0.0, enabled=True):
@@ -1078,132 +1286,105 @@ class ConstrainedPeak:
 @dataclass
 class ConstraintStore:
     """
-    Per-slice registry for constraints indexed by ParamRef.
-    
-    ConstraintStore manages all constraints for a single slice, providing:
-      - Registry: Dict[ParamRef, ConstraintRule]
-      - Validation: validate_all() method with error collection
-      - Application: apply_to_lmfit() for coordinated constraint application
-      - Backward compatibility: from_LinkStore() converter
-    
-    The store maintains a reverse index for efficient dependent lookup during
-    constraint application.
+    Per-slice registry of constraints.
+    Maps ParamRef (target) → ConstraintRule.
     """
+    _constraints: Dict[ParamRef, ConstraintRule] = field(default_factory=dict) #dict {target, rule}
+    _dependents: Dict[ParamRef, Set[ParamRef]] = field(default_factory=dict) #{driver, set(targets)}
     
-    constraints: Dict[Any, ConstraintRule] = field(default_factory=dict)  # {ParamRef → ConstraintRule}
-    reverse_index: Dict[Any, List[Any]] = field(default_factory=dict)  # {ParamRef(driver) → [ParamRef(targets)]}
+    def add_constraint(self, rule) -> None:
+        """Add or update a constraint"""
+        # Remove old reverse dependency
+        old = self._constraints.get(rule.target_pref)
+        if old and hasattr(old, 'driver_pref') and old.driver_pref:
+            self._dependents.get(old.driver_pref, set()).discard(rule.target_pref)
+
+        self._constraints[rule.target_pref] = rule
+        if rule.driver_pref:
+            self._dependents.setdefault(rule.driver_pref, set()).add(rule.target_pref)
+
+    def remove_constraint(self, target: ParamRef) -> None:
+        old = self._constraints.pop(target, None)
+        if old and old.driver_pref:
+            self._dependents.get(old.driver_pref, set()).discard(target)
+
+    def get_constraint(self, target: ParamRef) -> Optional[ConstraintRule]:
+        """Get constraint for a target parameter."""
+        return self._constraints.get(target)
     
-    def __post_init__(self):
-        """Rebuild reverse index after initialization."""
-        self._rebuild_reverse_index()
+    def is_constrained(self, target: ParamRef) -> bool:
+        s = self._constraints.get(target)
+        return bool(s and s.enabled)
+
+    def all_constraints(self) -> Iterable[Tuple[ParamRef, ConstraintRule]]:
+        """Iterate all (target, rule) pairs."""
+        return self._constraints.items()
     
-    def _rebuild_reverse_index(self) -> None:
-        """Rebuild the reverse index mapping drivers to targets."""
-        self.reverse_index.clear()
-        for target_pref, rule in self.constraints.items():
-            if rule is None or not getattr(rule, 'enabled', True):
-                continue
-            driver_pref = getattr(rule, 'driver_pref', None)
-            if driver_pref is not None:
-                if driver_pref not in self.reverse_index:
-                    self.reverse_index[driver_pref] = []
-                self.reverse_index[driver_pref].append(target_pref)
+    def get_dependents(self, driver: ParamRef) -> List[ParamRef]:
+        """Get all targets driven by this parameter."""
+        return list(self._dependents.get(driver, set()))
+
+
+@dataclass
+class FitOrchestrator:
+    """
+    Orchestrates constraint validation and application for fitting.
     
-    def add_constraint(self, target_pref: Any, rule: Optional[ConstraintRule]) -> None:
-        """
-        Register or unregister a constraint.
-        
-        Args:
-            target_pref: ParamRef identifying the target parameter
-            rule: ConstraintRule to apply, or None to unregister
-        """
-        if rule is None:
-            self.constraints.pop(target_pref, None)
-        else:
-            self.constraints[target_pref] = rule
-        self._rebuild_reverse_index()
+    Responsibilities:
+    - Validate all constraints before fitting
+    - Apply constraints to lmfit.Parameters in correct order
+    - Handle cross-slice dependencies
     
-    def get_constraint(self, target_pref: Any) -> Optional[ConstraintRule]:
-        """
-        Retrieve a constraint rule for the given target parameter reference.
-        """
-        return self.constraints.get(target_pref, None)
+    Does NOT:
+    - Execute fits (that's FitContext's job)
+    - Parse UI text (that's row_to_rule's job)
+    - Branch on constraint types (that's ConstraintRule.apply_to_lmfit's job)
+    """
+    constraint_store: ConstraintStore
     
-    def get_dependents(self, driver_pref: Any) -> List[Any]:
-        """
-        Get all target ParamRefs that depend on a driver.
-        
-        Args:
-            driver_pref: ParamRef of driver parameter
-        
-        Returns:
-            List of ParamRef objects for targets (empty if no dependents)
-        """
-        return self.reverse_index.get(driver_pref, [])
-    
-    def all_constraints(self):
-        """
-        Iterate over all constraints as (target_pref, rule) tuples.
-        
-        Returns:
-            Iterator of (target_pref, rule) tuples
-        """
-        return iter(self.constraints.items())
-    
-    def validate_all(
+    def validate_constraints(
         self,
-        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
-        slice_states: Dict[int, Any]  # {slice_id: SliceFitState}
+        peak_map: Dict[Tuple[int, int], Any],  # (slice_id, peak_id) → Peak
+        slice_states: Dict[int, Any],           # slice_id → SliceFitState
     ) -> List[ConstraintValidationError]:
         """
-        Validate all constraints in the store.
+        Validate all enabled constraints.
         
         Args:
-            peak_map: Dict {(slice_id, peak_id): Peak}
-            slice_states: Dict {slice_id: SliceFitState}
+            peak_map: Mapping from (slice_id, peak_id) to Peak objects
+            slice_states: Mapping from slice_id to SliceFitState
         
         Returns:
-            List of ConstraintValidationError (empty if all valid)
+            List of validation errors (empty if all valid)
         """
         errors = []
         
-        for target_pref, rule in self.constraints.items():
-            if rule is None or not getattr(rule, 'enabled', True):
+        for target_pref, rule in self.constraint_store.all_constraints():
+            if not getattr(rule, 'enabled', True):
                 continue
             
-            # Resolve target peak
+            # Get target peak
             target_key = (int(target_pref.slice_id), int(target_pref.peak_id))
-            target_peak = peak_map.get(target_key, None)
-            if target_peak is None:
-                errors.append(ConstraintValidationError(
-                    target_pref=target_pref,
-                    message=f"Target peak not found: {target_key}"
-                ))
-                continue
+            target_peak = peak_map.get(target_key)
             
-            # Resolve driver peak (if any)
+            # Get driver peak (if rule has a driver)
             driver_pref = getattr(rule, 'driver_pref', None)
             driver_peak = None
             if driver_pref is not None:
                 driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
-                driver_peak = peak_map.get(driver_key, None)
-                if driver_peak is None:
-                    errors.append(ConstraintValidationError(
-                        target_pref=target_pref,
-                        message=f"Driver peak not found: {driver_key}"
-                    ))
-                    continue
+                driver_peak = peak_map.get(driver_key)
             
-            # Validate constraint
+            # Validate this rule
             try:
-                error_msgs = rule.validate(
+                rule_errors = rule.validate(
                     target_peak=target_peak,
                     target_pref=target_pref,
                     driver_peak=driver_peak,
                     driver_pref=driver_pref,
                     slice_states=slice_states
                 )
-                for msg in error_msgs:
+                
+                for msg in rule_errors:
                     errors.append(ConstraintValidationError(
                         target_pref=target_pref,
                         message=msg
@@ -1211,356 +1392,53 @@ class ConstraintStore:
             except Exception as e:
                 errors.append(ConstraintValidationError(
                     target_pref=target_pref,
-                    message=f"Validation exception: {str(e)}"
+                    message=f"Validation exception: {e}"
                 ))
         
         return errors
     
-    def apply_to_lmfit(
+    def apply_constraints_to_lmfit(
         self,
-        params,
-        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
-        slice_states: Dict[int, Any],  # {slice_id: SliceFitState}
-        name_map: Optional[Dict[str, str]] = None
+        params,                                 # lmfit.Parameters
+        peak_map: Dict[Tuple[int, int], Any],  # (slice_id, peak_id) → Peak
+        slice_states: Dict[int, Any],           # slice_id → SliceFitState
     ) -> None:
         """
-        Apply all constraints to an lmfit Parameters object.
+        Apply all enabled constraints to lmfit.Parameters.
+        
+        Each ConstraintRule owns its own apply_to_lmfit() logic.
+        This method just coordinates the sequencing.
         
         Args:
-            params: lmfit.Parameters object to modify
-            peak_map: Dict {(slice_id, peak_id): Peak}
-            slice_states: Dict {slice_id: SliceFitState}
-            name_map: Optional dict mapping normalized param names to lmfit base names
+            params: lmfit.Parameters instance to configure
+            peak_map: Mapping from (slice_id, peak_id) to Peak objects
+            slice_states: Mapping from slice_id to SliceFitState
         """
-        if name_map is None:
-            name_map = {"pos": "pos", "amp": "amp", "lor": "lor", "gauss": "gauss"}
-        
-        def _norm(n: str) -> str:
-            return (n or "").strip().lower()
-        
-        for target_pref, rule in self.constraints.items():
-            if rule is None or not getattr(rule, 'enabled', True):
+        for target_pref, rule in self.constraint_store.all_constraints():
+            if not getattr(rule, 'enabled', True):
                 continue
             
-            # Resolve target peak
-            target_key = (int(target_pref.slice_id), int(target_pref.peak_id))
-            target_peak = peak_map.get(target_key, None)
-            if target_peak is None:
-                continue
-            
-            # Resolve driver peak (if any)
+            # Get driver peak (if rule has a driver)
             driver_pref = getattr(rule, 'driver_pref', None)
             driver_peak = None
             if driver_pref is not None:
                 driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
-                driver_peak = peak_map.get(driver_key, None)
+                driver_peak = peak_map.get(driver_key)
             
-            # Resolve lmfit parameter name
-            base_name = name_map.get(_norm(target_pref.name))
-            if not base_name:
-                continue
-            
-            peak_id = int(target_pref.peak_id)
-            key_tgt = f"{base_name}_{peak_id}"
-            p_tgt = params.get(key_tgt, None)
-            if p_tgt is None:
-                continue
-            
-            # Evaluate constraint
+            # Delegate to rule's apply logic
             try:
-                evaluated_value = rule.evaluate(
-                    target_peak=target_peak,
+                rule.apply_to_lmfit(
+                    params=params,
                     target_pref=target_pref,
                     driver_peak=driver_peak,
-                    driver_pref=driver_pref,
                     slice_states=slice_states
                 )
-            except Exception:
-                continue
-            
-            # Apply to lmfit based on constraint type and driver location
-            target_slice = int(target_pref.slice_id)
-            
-            # For LinearConstraint with same-slice driver: use algebraic expression
-            if (isinstance(rule, LinearConstraint) and 
-                driver_pref is not None and 
-                int(driver_pref.slice_id) == target_slice):
-                
-                driver_base = name_map.get(_norm(driver_pref.name))
-                if driver_base:
-                    driver_peak_id = int(driver_pref.peak_id)
-                    key_drv = f"{driver_base}_{driver_peak_id}"
-                    
-                    if key_drv in params:
-                        a = float(getattr(rule, 'a', 1.0))
-                        b = float(getattr(rule, 'b', 0.0))
-                        expr = f"{key_drv}*{a}+{b}"
-                        try:
-                            p_tgt.set(value=float(evaluated_value), expr=expr)
-                        except Exception:
-                            p_tgt.set(value=float(evaluated_value), vary=False)
-                        continue
-            
-            # All other cases: numeric freeze
-            try:
-                p_tgt.set(value=float(evaluated_value), vary=False)
-            except Exception:
-                pass
-    
-    @staticmethod
-    def from_LinkStore(link_store: Any) -> ConstraintStore:
-        """
-        Create ConstraintStore from legacy LinkStore (backward compatibility).
-        
-        Args:
-            link_store: LinkStore object with links list
-        
-        Returns:
-            ConstraintStore with constraints converted from LinkExpr objects
-        """
-        store = ConstraintStore()
-        
-        if link_store is None:
-            return store
-        
-        # Try all_expr() method first (LinkStore implementation)
-        try:
-            for link_expr in link_store.all_expr():
-                if link_expr is None:
-                    continue
-                try:
-                    rule = LinkExpr_to_ConstraintRule(link_expr)
-                    if rule is not None:
-                        target_pref = getattr(link_expr, 'target', None)
-                        if target_pref is not None:
-                            store.add_constraint(target_pref, rule)
-                except Exception:
-                    # Skip malformed LinkExpr objects
-                    continue
-        except Exception:
-            # Fallback: try _by_target dict (LinkStore internal structure)
-            try:
-                if hasattr(link_store, '_by_target'):
-                    for link_expr in link_store._by_target.values():
-                        if link_expr is None:
-                            continue
-                        try:
-                            rule = LinkExpr_to_ConstraintRule(link_expr)
-                            if rule is not None:
-                                target_pref = getattr(link_expr, 'target', None)
-                                if target_pref is not None:
-                                    store.add_constraint(target_pref, rule)
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-        
-        return store
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize ConstraintStore to JSON-compatible dict.
-        
-        Returns:
-            Dict with 'constraints' key containing serialized rules
-        """
-        constraints_dict = {}
-        for pref, rule in self.constraints.items():
-            pref_key = f"s{pref.slice_id}_p{pref.peak_id}_{pref.name}"
-            if rule is not None:
-                constraints_dict[pref_key] = ConstraintRuleFactory.to_dict(rule)
-        
-        return {
-            "constraints": constraints_dict
-        }
-    
-    @staticmethod
-    def from_dict(data: Dict[str, Any]) -> ConstraintStore:
-        """
-        Deserialize ConstraintStore from JSON dict.
-        
-        Args:
-            data: Dict with 'constraints' key
-        
-        Returns:
-            ConstraintStore instance
-        """
-        store = ConstraintStore()
-        
-        constraints_dict = data.get("constraints", {})
-        for pref_key, rule_data in constraints_dict.items():
-            try:
-                rule = ConstraintRuleFactory.from_dict(rule_data)
-                if rule is not None:
-                    # Parse pref_key: "s{slice}_p{peak}_{name}"
-                    parts = pref_key.split('_', 2)
-                    if len(parts) >= 3 and parts[0].startswith('s') and parts[1].startswith('p'):
-                        slice_id = int(parts[0][1:])
-                        peak_id = int(parts[1][1:])
-                        name = parts[2]
-                        
-                        # Import ParamRef lazily to avoid circular import
-                        from nmrFit_v0 import ParamRef
-                        pref = ParamRef(slice_id=slice_id, peak_id=peak_id, name=name)
-                        store.add_constraint(pref, rule)
-            except Exception:
-                # Skip malformed constraint data
-                continue
-        
-        return store
+            except Exception as e:
+                # Log but continue (defensive; validation should have caught this)
+                import logging
+                logging.getLogger("fit").warning(
+                    f"Failed to apply constraint for {fmt_pref(target_pref)}: {e}"
+                )
 
-
-@dataclass
-class FitOrchestrator:
-    """
-    Coordinator for fitting with constraints and bounds.
-    
-    Replaces LinkEngine.evaluate() with integrated constraint application.
-    
-    FitOrchestrator manages:
-      1. Constraint validation (constraints must be satisfied before fitting)
-      2. Constraint application to lmfit Parameters (algebraic expr + numeric freeze)
-      3. Topological ordering for constraint evaluation
-      4. Integration with FitContext for residual computation
-    
-    The orchestrator is slice-aware: constraints can be per-slice or cross-slice.
-    Linear same-slice constraints use algebraic expressions (Parameter.expr).
-    Cross-slice and exponential constraints use numeric freeze (Parameter.value, vary=False).
-    """
-    
-    constraint_store: Optional[ConstraintStore] = None
-    
-    def validate_constraints(
-        self,
-        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
-        slice_states: Dict[int, Any]  # {slice_id: SliceFitState}
-    ) -> List[ConstraintValidationError]:
-        """
-        Validate all constraints in the store before fitting.
-        
-        Returns:
-            List of validation errors (empty if all constraints valid)
-        """
-        if self.constraint_store is None:
-            return []
-        
-        return self.constraint_store.validate_all(peak_map, slice_states)
-    
-    def apply_constraints_to_lmfit(
-        self,
-        params,  # lmfit.Parameters
-        peak_map: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
-        slice_states: Dict[int, Any],  # {slice_id: SliceFitState}
-        name_map: Optional[Dict[str, str]] = None
-    ) -> None:
-        """
-        Apply all constraints to lmfit Parameters object.
-        
-        This method:
-          1. Iterates through all enabled constraints in the store
-          2. For linear same-slice: sets Parameter.expr (algebraic)
-          3. For others: sets Parameter.value and vary=False (numeric freeze)
-          4. Handles cross-slice drivers by computing numeric values
-        
-        Args:
-            params: lmfit.Parameters object to modify
-            peak_map: Dict {(slice_id, peak_id): Peak}
-            slice_states: Dict {slice_id: SliceFitState}
-            name_map: Optional dict mapping normalized param names to lmfit base names
-        """
-        if self.constraint_store is None:
-            return
-        
-        self.constraint_store.apply_to_lmfit(params, peak_map, slice_states, name_map)
-    
-    @staticmethod
-    def from_constraint_store(store: Optional[ConstraintStore]) -> FitOrchestrator:
-        """Create FitOrchestrator from ConstraintStore."""
-        return FitOrchestrator(constraint_store=store)
-    
-    @staticmethod
-    def from_link_store(link_store: Any) -> FitOrchestrator:
-        """
-        Create FitOrchestrator from legacy LinkStore (backward compatibility).
-        
-        Args:
-            link_store: LinkStore object
-        
-        Returns:
-            FitOrchestrator with constraints converted from LinkStore
-        """
-        if link_store is None:
-            return FitOrchestrator(constraint_store=None)
-        
-        store = ConstraintStore()
-        
-        # LinkStore uses all_expr() method to iterate over LinkExpr objects
-        try:
-            for link_expr in link_store.all_expr():
-                if link_expr is None:
-                    continue
-                try:
-                    rule = LinkExpr_to_ConstraintRule(link_expr)
-                    if rule is not None:
-                        target_pref = getattr(link_expr, 'target', None)
-                        if target_pref is not None:
-                            store.add_constraint(target_pref, rule)
-                except Exception:
-                    # Skip malformed LinkExpr objects
-                    continue
-        except Exception:
-            # If all_expr() fails, try iterating _by_target.values()
-            try:
-                if hasattr(link_store, '_by_target'):
-                    for link_expr in link_store._by_target.values():
-                        if link_expr is None:
-                            continue
-                        try:
-                            rule = LinkExpr_to_ConstraintRule(link_expr)
-                            if rule is not None:
-                                target_pref = getattr(link_expr, 'target', None)
-                                if target_pref is not None:
-                                    store.add_constraint(target_pref, rule)
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-        
-        return FitOrchestrator(constraint_store=store)
-    
-    def integrate_with_fit_context(
-        self,
-        fit_context: Any,  # FitContext object
-        peaks: List[Any],  # List[Peak]
-        slice_id: int,
-        peak_map: Dict[tuple, Any],
-        slice_states: Dict[int, Any]
-    ) -> None:
-        """
-        Integrate constraints into FitContext workflow.
-        
-        This method:
-          1. Validates constraints in context of current fit
-          2. Applies constraints to lmfit Parameters
-          3. Updates FitContext._apply_links_to_lmfit if needed
-        
-        Args:
-            fit_context: FitContext instance
-            peaks: List of Peak objects for slice
-            slice_id: Current slice ID
-            peak_map: Dict {(slice_id, peak_id): Peak}
-            slice_states: Dict {slice_id: SliceFitState}
-        """
-        # Validate constraints first
-        errors = self.validate_constraints(peak_map, slice_states)
-        if errors:
-            error_messages = [f"{e.target_pref}: {e.message}" for e in errors]
-            raise ValueError(f"Constraint validation failed:\n" + "\n".join(error_messages))
-        
-        # Get lmfit Parameters from FitContext (assumes build_params was called)
-        # This is typically done before calling this method
-        # fit_context.params would be set by caller
-    
-    def __repr__(self) -> str:
-        store_info = "ConstraintStore" if self.constraint_store else "None"
-        return f"FitOrchestrator(constraint_store={store_info})"
+register_constraint_rule(ConstraintType.LINEAR, LinearConstraint)
+register_constraint_rule(ConstraintType.RELAX_EXP, RelaxDecayConstraint)
