@@ -4,7 +4,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, TYPE_CHECKING, Tuple, Iterable, Set
 from enum import Enum
+from matplotlib.units import registry
 import numpy as np  # Add missing import for np.isfinite
+import logging
+
+log = logging.getLogger("fit")
 
 # Use TYPE_CHECKING to avoid circular import at runtime
 # nmrFit_v0 → constraint_rules, constraint_rules → nmrFit_v0 creates cycle
@@ -236,21 +240,21 @@ class ConstraintRule(ABC):
     @abstractmethod
     def apply_to_lmfit(
         self,
-        params,
-        target_pref: ParamRef,
-        driver_peak: Optional[Peak],
-        slice_states: Dict[int, Any]
+        params: Dict[str, Any],
+        registry: Dict[ParamRef, Dict[str, Any]],
+        allow_external: bool = False,
+        vary: bool = True,
     ) -> None:
         """
         Apply constraint to lmfit Parameters.
-        
+                
         For same-slice constraints: set Parameter.expr (lmfit evaluates)
         For cross-slice constraints: compute value and freeze (vary=False)
         
         Args:
             params: lmfit.Parameters instance
             target_pref: ParamRef for target parameter
-            driver_peak: Peak object for driver (needed for cross-slice computation)
+            driver_pref: ParamRef for driver parameter -> driver_peak to get value
             slice_states: Dict mapping slice_id → SliceFitState
         """
         raise NotImplementedError
@@ -470,13 +474,13 @@ class LinearConstraint(ConstraintRule):
         cls,
         *,
         target_pref: ParamRef,
-        driver_pref: Optional[ParamRef],
+        driver_pref: ParamRef,
         expr_txt: str,  # Changed from UI_txt to match signature
         enabled: bool = True,
     ) -> "ConstraintRule":
         """Create a LinearConstraint from UI driver + expr cells."""
         a, b, driver_txt = cls.parse_UItext(expr_txt)
-        canonical_expr = cls.UItext_to_expr(expr_txt)
+        std_expr = cls.UItext_to_expr(expr_txt)
         
         # Parse driver from expression
         drv_from_expr = txt_to_pref(driver_txt)  # driver_txt is guaranteed non-None
@@ -498,7 +502,7 @@ class LinearConstraint(ConstraintRule):
             a=a,
             b=b,
             enabled=enabled,
-            expr_txt=canonical_expr
+            expr_txt=std_expr
         )
     
     def validate(
@@ -506,7 +510,7 @@ class LinearConstraint(ConstraintRule):
         target_peak: Peak,
         target_pref: ParamRef,
         driver_peak: Optional[Peak],
-        driver_pref: Optional[ParamRef],
+        driver_pref: ParamRef,
         slice_states: Dict[int, Any]
     ) -> List[str]:
         """Validate semantic preconditions: driver exists and coefficients are finite."""
@@ -533,44 +537,76 @@ class LinearConstraint(ConstraintRule):
             )
         
         return errors
-    
+           
     def apply_to_lmfit(
         self,
-        params,
-        target_pref: ParamRef,
-        driver_peak: Peak,
-        slice_states: Dict[int, Any],
-        enabled: bool = True,
-        vary: bool = True
+        *,
+        params: Dict[str, Any],
+        registry: Dict[ParamRef, Dict[str, Any]],  # {'value': float}
+        allow_external: bool = False,
+        vary: bool = True,  # True=joint, False=sequential/single
     ) -> None:
+        
         """
         Apply linear constraint to lmfit.
         
-        Same-slice: set Parameter.expr = "a*driver_key + b" and Vary=True
-        Cross-slice: Sequential -> compute value and freeze. Joint -> use expr and Vary=True
+        Same-slice: set Parameter.expr = "a*driver_key + b" with vary=True (algebraic)
+        Cross-slice: depends on mode
+          - Sequential (vary=False): compute value and freeze
+          - Joint (vary=True): set expr and vary=True
+        
+        This method is called by FitOrchestrator for each target ParamRef that
+        has this constraint rule.
         """
-        if enabled and vary == True:
-            param_key = fmt_pref(target_pref)
 
-            if param_key not in params:
+        target_pref = self.target_pref
+        target_key = fmt_pref(target_pref)
+
+        if target_key not in params:
+            return
+
+        p_tgt = params[target_key]
+
+        same_slice = int(self.driver_pref.slice_id) == int(target_pref.slice_id)
+
+        # --- Internal (same-slice): prefer algebraic expr if driver exists in params ---
+        if same_slice:
+            drv_key = fmt_pref(self.driver_pref)
+
+            if drv_key in params:
+                # Dependent parameter: express algebraic dependency.
+                # Target should NOT be an independent DOF.
+                expr_lmfit = self.rule_to_expr()
+                p_tgt.set(expr=expr_lmfit, vary=True)
                 return
 
-            param = params[param_key]
-            driver_key = fmt_pref(self.driver_pref)
+            # Fallback: driver param not present -> numeric freeze using registry
+            info = registry.get(self.driver_pref)
+            if not info or "value" not in info:
+                raise ValueError(f"Missing driver value for internal linear constraint: {fmt_pref(self.driver_pref)}")
+            drv_val = float(info["value"])
+            val = float(self.a) * drv_val + float(self.b)
+            p_tgt.set(value=float(val), expr="", vary=False)
+            return
 
-            # Check if driver is in same slice (can use algebraic expr)
-            if int(self.driver_pref.slice_id) == int(target_pref.slice_id):
-                # Same-slice: use Parameter.expr
-                expr_lmfit = self.rule_to_expr()
-                param.set(expr=expr_lmfit)
+        # --- External (cross-slice)
+        if not allow_external:
+            raise ValueError(
+                f"Cannot apply cross-slice constraint on {target_key} when allow_external=False"
+            )
+        
+        expr_lmfit = self.rule_to_expr()
+        info = registry.get(self.driver_pref)
+        if not info or "value" not in info:
+            raise ValueError(f"Missing external driver value for {fmt_pref(self.driver_pref)}")
 
-        else:
-            # Cross-slice: compute value and freeze
-            if driver_peak is None:
-                return  # validation should have caught this
-            driver_value = _get_peak_value(driver_peak, self.driver_pref.name)
-            computed_value = float(self.a * driver_value + self.b)
-            param.set(value=computed_value, expr=expr_lmfit, vary=False)
+        drv_val = float(info["value"])
+        val = float(self.a) * drv_val + float(self.b)
+
+        if not vary: # Sequential mode: freeze with computed value. Clear expr.
+            p_tgt.set(value=float(val), expr="", vary=False)
+        else:  # Joint mode: use algebraic expression (cross-slice)            
+            p_tgt.set(expr=expr_lmfit, vary=True)
 
 class RelaxDecayConstraint(ConstraintRule):
     """
@@ -852,10 +888,10 @@ class RelaxDecayConstraint(ConstraintRule):
     
     def apply_to_lmfit(
         self,
-        params,
-        target_pref: ParamRef,
-        driver_peak: Optional[Peak],
-        slice_states: Dict[int, Any]
+        params: Dict[str, Any],
+        registry: Dict[ParamRef, Dict[str, Any]],
+        allow_external: bool = False,
+        vary: bool = True,
     ) -> None:
         """
         Apply exponential constraint to lmfit.
@@ -863,13 +899,26 @@ class RelaxDecayConstraint(ConstraintRule):
         For exponential constraints, set the parameter to fixed value
         (expression building would be complex; evaluation is done once upfront).
         """
+        # Get target from self (rule knows its target)
+        target_pref = self.target_pref
         param_key = fmt_pref(target_pref)
         
         if param_key not in params:
             return
         
-        if driver_peak is None:
+        # Get driver peak from registry
+        driver_info = registry.get(self.driver_pref)
+        if driver_info is None:
             return  # validation should have caught this
+        
+        driver_peak = driver_info.get("peak")
+        if driver_peak is None:
+            return
+        
+        # Get slice_states (need to extract from constraint_store or pass differently)
+        # For now, access via constraint_store internals or make slice_states available
+        # WORKAROUND: Extract slice_id from target_pref and assume we can access it
+        slice_states = {}  # TODO: Need to pass slice_states properly
         
         # Get time value
         t = self._get_time_value(target_pref, slice_states)
@@ -930,69 +979,13 @@ class ConstraintRuleFactory:
     """
     
     @staticmethod
-    def parse_row_to_constraint(*, target, type_txt: str, driver, expr_txt: str):
-        """
-        Single place to convert a 4-cell row into ConstraintRule.
-        Try in this order:
-        1) if expr_txt starts with '=' → inline
-        2) else if type is RELAX_EXP → parse KV style
-        3) else → linear implicit
-        """
-        if expr_txt.startswith("="):
-            return ConstraintRuleFactory.parse_UItext(target, expr_txt.lstrip("="))
+    def to_dict(self, store) -> Dict:
+        """Serialize constraint rule to dictionary."""
+        pass
 
-        if type_txt.upper() == "RELAX_EXP":
-            return ConstraintRuleFactory.parse_inline_or_kv(target, expr_txt)
-
-        if driver is not None and not expr_txt:
-            return LinearConstraint(
-                target_pref=target,
-                driver_pref=driver,
-                a=1.0,
-                b=0.0,
-                enabled=True,
-            )
-
-        return ConstraintRuleFactory.parse_UItext(target, expr_txt)
-
-
-    @staticmethod
-    def create_linear_constraint(target_pref, driver_pref, a=1.0, b=0.0, enabled=True):
-        """
-        Create a LinearConstraint directly from user input parameters.
-        """
-        return LinearConstraint(
-            target_pref=target_pref,
-            driver_pref=driver_pref,
-            a=a,
-            b=b,
-            enabled=enabled
-        )
-
-    @staticmethod
-    def create_relax_decay_constraint(
-        target_pref,
-        driver_pref,
-        T_seconds,
-        A=1.0,
-        C=0.0,
-        time_seconds=None,
-        T_name=None,
-        enabled=True
-    ):
-        """
-        Create a RelaxDecayConstraint directly from user input parameters.
-        """
-        return RelaxDecayConstraint(
-            target_pref=target_pref,
-            driver_pref=driver_pref,
-            T_seconds=T_seconds,
-            A=A,
-            C=C,
-            time_seconds=time_seconds,
-            T_name=T_name,
-            enabled=enabled
-        )
+    def from_dict(self, dict) -> ConstraintStore:
+        """Parse dictionary to constraint rule."""
+        pass
 
 
 # ============================================================================
@@ -1091,198 +1084,6 @@ def ConstraintRule_to_LinkExpr(rule: ConstraintRule):
     else:
         raise ValueError(f"Unknown constraint rule type: {type(rule)}")
 
-
-# ============================================================================
-# ConstrainedPeak Aggregate: Wraps Peak + Constraints Dictionary
-# ============================================================================
-
-@dataclass
-class ConstrainedPeak:
-    """
-    Aggregate that combines a Peak with its associated constraints.
-    
-    This is the core entity in the Aggregate Pattern for constraint management.
-    Each ConstrainedPeak manages:
-      1. A single Peak (amplitude, position, widths)
-      2. A dictionary of ConstraintRules keyed by parameter name
-      3. Validation and application of constraints to lmfit
-    
-    Attributes:
-        peak: The Peak object (pos, amp, lor_hz, gauss_disp)
-        constraints: Dict[str, ConstraintRule] mapping param names to rules
-                     Example: {"amp": LinearConstraint(...), "pos": RelaxDecayConstraint(...)}
-    """
-    peak: Any  # Peak (deferred type to avoid circular import)
-    constraints: Dict[str, ConstraintRule] = field(default_factory=dict)
-    
-    def get_constraint(self, param_name: str) -> Optional[ConstraintRule]:
-        """
-        Retrieve a constraint rule for the given target parameter reference.
-        """
-        return self.constraints.get(str(param_name).lower(), None)
-    
-    def set_constraint(self, param_name: str, rule: Optional[ConstraintRule]) -> None:
-        """
-        Register or unregister a constraint for a parameter.
-        
-        Args:
-            param_name: Name of parameter ("pos", "amp", "lor", "gauss")
-            rule: ConstraintRule to register, or None to clear
-        """
-        pname = str(param_name).lower()
-        if rule is None:
-            self.constraints.pop(pname, None)
-        else:
-            self.constraints[pname] = rule
-    
-    def validate(
-        self,
-        target_pref: Any,  # ParamRef (deferred type)
-        driver_peaks: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
-        slice_states: Dict[int, Any]  # {slice_id: SliceFitState}
-    ) -> List[ConstraintValidationError]:
-        """
-        Validate all constraints for this peak.
-        
-        Args:
-            target_pref: ParamRef identifying this peak's slice and peak_id
-            driver_peaks: Dict mapping (slice_id, peak_id) → Peak for all drivers
-            slice_states: Dict mapping slice_id → SliceFitState
-            
-        Returns:
-            List of ConstraintValidationError for any validation failures (empty if valid)
-        """
-        errors: List[ConstraintValidationError] = []
-        
-        for param_name, rule in self.constraints.items():
-            if rule is None or not getattr(rule, 'enabled', True):
-                continue
-            
-            # Find driver peak if needed
-            driver_pref = getattr(rule, 'driver_pref', None)
-            driver_peak = None
-            if driver_pref is not None:
-                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
-                driver_peak = driver_peaks.get(driver_key, None)
-            
-            # Validate constraint
-            try:
-                validation_errors = rule.validate(
-                    target_peak=self.peak,
-                    target_pref=target_pref,
-                    driver_peak=driver_peak,
-                    driver_pref=driver_pref,
-                    slice_states=slice_states
-                )
-                
-                for error_msg in validation_errors:
-                    errors.append(ConstraintValidationError(
-                        target_pref=target_pref,
-                        message=f"Parameter '{param_name}': {error_msg}"
-                    ))
-            except Exception as e:
-                errors.append(ConstraintValidationError(
-                    target_pref=target_pref,
-                    message=f"Parameter '{param_name}': Validation exception: {str(e)}"
-                ))
-        
-        return errors
-    
-    def apply_constraints_to_lmfit(
-        self,
-        params: Any,  # lmfit.Parameters
-        target_pref: Any,  # ParamRef
-        driver_peaks: Dict[tuple, Any],  # {(slice_id, peak_id): Peak}
-        slice_states: Dict[int, Any],  # {slice_id: SliceFitState}
-        name_map: Optional[Dict[str, str]] = None  # {normalized_name: lmfit_base_name}
-    ) -> None:
-        """
-        Apply all enabled constraints to an lmfit Parameters object.
-        
-        This method:
-          1. Evaluates each constraint to compute target values
-          2. Sets lmfit Parameter.expr (for linear same-slice) or .value/.vary (for others)
-          3. Handles cross-slice drivers by freezing with numeric values
-        
-        Args:
-            params: lmfit.Parameters object to modify
-            target_pref: ParamRef identifying this peak (slice_id, peak_id)
-            driver_peaks: Dict {(slice_id, peak_id): Peak}
-            slice_states: Dict {slice_id: SliceFitState}
-            name_map: Optional dict mapping normalized param names to lmfit base names
-                      Default: {"pos": "pos", "amp": "amp", "lor": "lor", "gauss": "gauss"}
-        """
-        if name_map is None:
-            name_map = {"pos": "pos", "amp": "amp", "lor": "lor", "gauss": "gauss"}
-        
-        def _norm(n: str) -> str:
-            return (n or "").strip().lower()
-        
-        for param_name, rule in self.constraints.items():
-            if rule is None or not getattr(rule, 'enabled', True):
-                continue
-            
-            # Resolve lmfit parameter name
-            base_name = name_map.get(_norm(param_name))
-            if not base_name:
-                continue
-            
-            peak_id = int(target_pref.peak_id)
-            key_tgt = f"{base_name}_{peak_id}"  # e.g., "amp_0", "pos_1"
-            p_tgt = params.get(key_tgt, None)
-            if p_tgt is None:
-                continue
-            
-            # Find driver peak
-            driver_pref = getattr(rule, 'driver_pref', None)
-            driver_peak = None
-            if driver_pref is not None:
-                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
-                driver_peak = driver_peaks.get(driver_key, None)
-            
-            # Evaluate constraint to get target value
-            try:
-                evaluated_value = rule.evaluate(
-                    target_peak=self.peak,
-                    target_pref=target_pref,
-                    driver_peak=driver_peak,
-                    driver_pref=driver_pref,
-                    slice_states=slice_states
-                )
-            except Exception:
-                # If evaluation fails, skip this constraint
-                continue
-            
-            # Apply to lmfit based on constraint type and driver location
-            target_slice = int(target_pref.slice_id)
-            
-            # For LinearConstraint with same-slice driver: use algebraic expression
-            if (isinstance(rule, LinearConstraint) and 
-                driver_pref is not None and 
-                int(driver_pref.slice_id) == target_slice):
-                
-                driver_base = name_map.get(_norm(driver_pref.name))
-                if driver_base:
-                    driver_peak_id = int(driver_pref.peak_id)
-                    key_drv = f"{driver_base}_{driver_peak_id}"
-                    
-                    if key_drv in params:
-                        a = float(getattr(rule, 'a', 1.0))
-                        b = float(getattr(rule, 'b', 0.0))
-                        expr = f"{key_drv}*{a}+{b}"
-                        try:
-                            p_tgt.set(value=float(evaluated_value), expr=expr)
-                        except Exception:
-                            p_tgt.set(value=float(evaluated_value), vary=False)
-                        continue
-            
-            # All other cases: numeric freeze
-            try:
-                p_tgt.set(value=float(evaluated_value), vary=False)
-            except Exception:
-                pass
-
-
 @dataclass
 class ConstraintStore:
     """
@@ -1323,6 +1124,103 @@ class ConstraintStore:
     def get_dependents(self, driver: ParamRef) -> List[ParamRef]:
         """Get all targets driven by this parameter."""
         return list(self._dependents.get(driver, set()))
+    
+
+@dataclass
+class LinkEngine:
+    """
+    Dependency-analysis engine that works with the *new* ConstraintStore (not LinkStore).
+
+    Design goals:
+      - UI-agnostic: no imports from nmrFit_v0 / Qt
+      - Operates only on ParamRef + ConstraintRule via rule.driver_pref
+      - Provides graph utilities needed by FitOrchestrator (external driver discovery,
+        per-slice filtering, topo-ordering for future registry evaluation)
+    """
+
+    def rules_for_target_slice(
+        self,
+        *,
+        store: "ConstraintStore",
+        slice_id: int,
+        enabled_only: bool = True,
+    ) -> List[Tuple[ParamRef, "ConstraintRule"]]:
+        """
+        Return [(target_pref, rule), ...] whose *target* lives in slice_id.
+        """
+        out: List[Tuple[ParamRef, "ConstraintRule"]] = []
+        for tgt, rule in store.all_constraints():
+            if int(tgt.slice_id) != int(slice_id):
+                continue
+            if enabled_only and not getattr(rule, "enabled", True):
+                continue
+            out.append((tgt, rule))
+        return out
+
+    def get_external_driver_slices(
+        self,
+        *,
+        store: "ConstraintStore",
+        target_slice_id: int,
+        enabled_only: bool = True,
+    ) -> Set[int]:
+        """
+        Return the set of slice_ids that appear as *drivers* for constraints whose
+        targets are in target_slice_id, excluding same-slice drivers.
+        """
+        out: Set[int] = set()
+        for tgt, rule in self.rules_for_target_slice(
+            store=store, slice_id=target_slice_id, enabled_only=enabled_only
+        ):
+            drv = getattr(rule, "driver_pref", None)
+            if drv is None:
+                continue
+            ds = int(drv.slice_id)
+            ts = int(tgt.slice_id)
+            if ds != ts:
+                out.add(ds)
+        return out
+
+    def topo_sort_paramrefs(
+        self,
+        *,
+        store: "ConstraintStore",
+        enabled_only: bool = True,
+    ) -> List[ParamRef]:
+        """
+        Topologically sort ParamRefs using dependencies implied by rule.driver_pref.
+        Nodes include enabled targets and any referenced drivers.
+
+        Raises:
+            ValueError if a cycle is detected.
+        """
+        edges: Dict[ParamRef, List[ParamRef]] = {}
+        indeg: Dict[ParamRef, int] = {}
+
+        for tgt, rule in store.all_constraints():
+            if enabled_only and not getattr(rule, "enabled", True):
+                continue
+            indeg.setdefault(tgt, 0)
+            drv = getattr(rule, "driver_pref", None)
+            if drv is None:
+                continue
+            edges.setdefault(drv, []).append(tgt)
+            indeg.setdefault(drv, 0)
+            indeg[tgt] = indeg.get(tgt, 0) + 1
+
+        q: List[ParamRef] = [n for n, k in indeg.items() if k == 0]
+        ordered: List[ParamRef] = []
+        while q:
+            u = q.pop()
+            ordered.append(u)
+            for v in edges.get(u, []):
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+
+        if len(ordered) != len(indeg):
+            raise ValueError("Link/constraint cycle detected among enabled rules.")
+        return ordered
 
 
 @dataclass
@@ -1336,11 +1234,26 @@ class FitOrchestrator:
     - Handle cross-slice dependencies
     
     Does NOT:
-    - Execute fits (that's FitContext's job)
+    - Execute fits (that's lmfit's job)
     - Parse UI text (that's row_to_rule's job)
     - Branch on constraint types (that's ConstraintRule.apply_to_lmfit's job)
     """
     constraint_store: ConstraintStore
+    link_engine: LinkEngine = field(default_factory=LinkEngine)
+
+    def rules_for_target_slice(
+        self, *, slice_id: int, enabled_only: bool = True
+    ) -> List[Tuple[ParamRef, "ConstraintRule"]]:
+        return self.link_engine.rules_for_target_slice(
+            store=self.constraint_store, slice_id=slice_id, enabled_only=enabled_only
+        )
+
+    def get_external_driver_slices(
+        self, *, target_slice_id: int, enabled_only: bool = True
+    ) -> Set[int]:
+        return self.link_engine.get_external_driver_slices(
+            store=self.constraint_store, target_slice_id=target_slice_id, enabled_only=enabled_only
+        )
     
     def validate_constraints(
         self,
@@ -1397,48 +1310,303 @@ class FitOrchestrator:
         
         return errors
     
+    @staticmethod
+    def build_registry_for_slice(
+        *,
+        slice_id: int,
+        slice_states: Dict[int, Any],
+        peaks_override: Optional[List[Any]] = None,
+    ) -> Dict["ParamRef", Dict[str, Any]]:
+        """
+        Build a numeric registry dict for one slice. 
+        Bridge between Peaks and ConstraintRules.
+        Registry contains a mapping:
+            ParamRef -> {"value": float} (Peak parameter values)
+
+        Registry also contains a cross-slice driver if any such driver is needed.
+
+        Notes:
+        - This function is UI-agnostic.
+        - It reads peak values from either:
+            (a) peaks_override (authoritative for current slice), or
+            (b) slice_states[slice_id].peaks
+        - Bounds are NOT included (bounds belong in FitContext._build_params).
+        """
+        sid = int(slice_id)
+        reg: Dict["ParamRef", Dict[str, Any]] = {}
+
+        # Decide source of peaks
+        peaks = peaks_override
+        if peaks is None:
+            st = (slice_states or {}).get(sid, None)
+            peaks = getattr(st, "peaks", None) if st is not None else None
+
+        if not peaks:
+            return reg
+
+        # Map ParamRef.name -> Peak attribute
+        name_to_attr = {"pos": "pos", "amp": "amp", "lor": "lor_hz", "gauss": "gauss_disp",}
+
+        for pid, pk in enumerate(peaks):
+            pid = int(pid)
+            for pname, attr in name_to_attr.items():
+                try:
+                    val = float(getattr(pk, attr))
+                except Exception:
+                    # Defensive: skip missing/invalid values rather than crashing the fit
+                    continue
+                pref = ParamRef(slice_id=sid, peak_id=pid, name=pname)
+                reg[pref] = {"value": val}
+
+        return reg
+    
+    @staticmethod
+    def build_registry_for_slices(
+        *,
+        slice_ids: Iterable[int],
+        slice_states: Dict[int, Any],
+        peaks_overrides: Optional[Dict[int, List[Any]]] = None,
+    ) -> Dict["ParamRef", Dict[str, Any]]:
+        """
+        Build a merged numeric registry for multiple slices.
+        Args:
+            slice_ids:
+                Slices to include in the registry.
+            slice_states:
+                {slice_id -> SliceFitState-like} object whose .peaks holds Peak objects.
+            peaks_overrides:
+                Optional {slice_id -> peaks_list}. Use this when the current slice’s
+                peaks are "live" in the UI/model and may not match slice_states[sid].peaks.
+
+        Returns:
+            A single merged registry dict[ParamRef] -> {"value": float, "fixed": bool}.
+            If the same ParamRef is encountered twice, later entries overwrite earlier ones.
+        """
+        reg: Dict["ParamRef", Dict[str, Any]] = {}
+        overrides = peaks_overrides or {}
+
+        for sid in slice_ids:
+            sid = int(sid)
+            part = FitOrchestrator.build_registry_for_slice(
+                slice_id=sid,
+                slice_states=slice_states,
+                peaks_override=overrides.get(sid),
+            )
+            reg.update(part)
+
+        return reg
+    
+    def _seed_external_drivers_into_registry(
+        self,
+        *,
+        registry: Dict[ParamRef, Dict[str, Any]],
+        slice_states: Dict[int, Any],
+        target_slice_id: int,
+        enabled_only: bool = True,
+        strict: bool = True,
+    ) -> Set[ParamRef]:
+        """
+        For enabled constraints targeting target_slice_id whose driver lives in another slice,
+        inject the driver's numeric value into registry.
+
+        Returns:
+          Set of external (cross-slice) driver ParamRefs required by constraints targeting this slice.
+        """
+        sid = int(target_slice_id)
+        missing: List[Tuple[ParamRef, str]] = []
+        external: Set[ParamRef] = set()
+
+        # 1) Collect external drivers needed for rules targeting this slice
+        for tgt, rule in self.constraint_store.all_constraints():
+            if enabled_only and not getattr(rule, "enabled", True):
+                continue
+            if int(tgt.slice_id) != sid:
+                continue
+
+            drv = getattr(rule, "driver_pref", None)
+            if drv is None:
+                continue
+
+            if int(drv.slice_id) != int(tgt.slice_id):
+                external.add(drv)
+
+        if not external:
+            return set()
+
+        # 2) Canonical mapping name -> Peak attribute
+        # No normalization/synonyms: upstream must ensure ParamRef.name is canonical.
+        name_to_attr = {"pos": "pos", "amp": "amp", "lor": "lor_hz", "gauss": "gauss_disp",}
+
+        # 3) Seed values
+        for drv in external:
+            # Preserve any caller-provided value
+            if drv in registry and "value" in (registry.get(drv) or {}):
+                continue
+
+            ds = int(drv.slice_id)
+            st = (slice_states or {}).get(ds)
+            if st is None:
+                missing.append((drv, f"slice_states[{ds}] not found"))
+                continue
+
+            peaks = getattr(st, "peaks", None)
+            if not peaks:
+                missing.append((drv, f"slice_states[{ds}].peaks missing/empty"))
+                continue
+
+            try:
+                pk = peaks[int(drv.peak_id)]
+            except Exception:
+                missing.append((drv, f"peak_id {drv.peak_id} not present in slice {ds} (len={len(peaks)})"))
+                continue
+
+            pname = getattr(drv, "name", None)
+            attr = name_to_attr.get(pname)
+            if attr is None:
+                missing.append((drv, f"non-canonical ParamRef.name '{pname}' (expected one of {sorted(name_to_attr)})"))
+                continue
+
+            try:
+                val = float(getattr(pk, attr))
+            except Exception as ex:
+                missing.append((drv, f"value read failed for attr '{attr}': {ex}"))
+                continue
+
+            registry[drv] = {"value": val}
+
+        if strict and missing:
+            lines = [f"- driver {fmt_pref(drv)}: {why}" for drv, why in missing]
+            raise RuntimeError("Cross-slice driver seeding failed:\n" + "\n".join(lines))
+
+        return external
+
+
     def apply_constraints_to_lmfit(
         self,
-        params,                                 # lmfit.Parameters
-        peak_map: Dict[Tuple[int, int], Any],  # (slice_id, peak_id) → Peak
-        slice_states: Dict[int, Any],           # slice_id → SliceFitState
+        *,
+        params,  # lmfit.Parameters (dict-like)
+        registry: Dict[ParamRef, Dict[str, Any]],  # {'value': float}
+        slice_states: Dict[int, Any],
+        slice_id: int,
+        allow_external: bool,
+        vary: bool,
+        strict_external_seed: bool = True,
     ) -> None:
         """
-        Apply all enabled constraints to lmfit.Parameters.
-        
-        Each ConstraintRule owns its own apply_to_lmfit() logic.
-        This method just coordinates the sequencing.
-        
+        Apply enabled constraints targeting slice_id.
+
+        If allow_external is True:
+          - seed external driver values from slice_states into registry (unless already provided)
+
+        If allow_external is False:
+          - raise ValueError if any cross-slice drivers are required for this slice
+
         Args:
-            params: lmfit.Parameters instance to configure
-            peak_map: Mapping from (slice_id, peak_id) to Peak objects
-            slice_states: Mapping from slice_id to SliceFitState
+          params: lmfit.Parameters
+          registry: ParamRef -> {'value': float}
+          slice_states: slice_id -> SliceFitState-like (must provide .peaks for external seeding)
+          slice_id: apply only constraints whose target_pref.slice_id == slice_id
+          allow_external: whether cross-slice drivers are allowed
+          vary: mode hint (False sequential, True joint)
+          strict_external_seed: whether missing external values raise (True) or warn+skip (False)
         """
-        for target_pref, rule in self.constraint_store.all_constraints():
-            if not getattr(rule, 'enabled', True):
+        sid = int(slice_id)
+
+        # Targets in this run (only the current slice)
+        targets_in_run = {p for p in registry.keys() if int(p.slice_id) == sid}
+
+        rules_internal: List[Tuple[ParamRef, Any]] = [] # (target, rule)
+        rules_external: List[Tuple[ParamRef, Any]] = [] # (target, rule)
+
+        # Collect enabled rules for targets present in this run
+        for tgt in targets_in_run:
+            rule = self.constraint_store.get_constraint(tgt)
+            if rule is None or not getattr(rule, "enabled", True):
                 continue
-            
-            # Get driver peak (if rule has a driver)
-            driver_pref = getattr(rule, 'driver_pref', None)
-            driver_peak = None
-            if driver_pref is not None:
-                driver_key = (int(driver_pref.slice_id), int(driver_pref.peak_id))
-                driver_peak = peak_map.get(driver_key)
-            
-            # Delegate to rule's apply logic
+
+            drv = getattr(rule, "driver_pref", None)
+            if drv is None:
+                # If you ever allow driverless constraints later, handle here.
+                # For now, skip/raise depending on policy.
+                continue
+
+            if int(drv.slice_id) == int(tgt.slice_id):
+                rules_internal.append((tgt, rule))
+            else:
+                rules_external.append((tgt, rule))
+
+        if not rules_internal and not rules_external:
+            return
+
+        # External drivers: enforce allow_external
+        if rules_external and not allow_external:
+            driver_slices = sorted({int(getattr(rule, "driver_pref").slice_id) for _, rule in rules_external})
+            raise ValueError(
+                f"Cross-slice constraints detected for slice {sid}: driver slices={driver_slices}. "
+                "Call with allow_external=True (and provide slice_states), or use Fit Selected."
+            )
+
+        # Seed external driver values into registry for apply_to_lmfit call later to calculate driver values.
+        external_drivers: Set[ParamRef] = set()
+        if rules_external and allow_external:
+            external_drivers = self._seed_external_drivers_into_registry(
+                registry=registry,
+                slice_states=slice_states,
+                target_slice_id=sid,
+                strict=strict_external_seed,
+            )
+
+        # Apply INTERNAL rules first (so same-slice expr wiring happens before numeric freezes)
+        for tgt, rule in rules_internal:
             try:
+                # warn+override: internal driver must be able to vary if use expr
+                drv = getattr(rule, "driver_pref", None)
+                if drv is not None:
+                    drv_key = fmt_pref(drv)
+                    if drv_key in params and getattr(params[drv_key], "vary", True) is False:
+                        log.warning(
+                            "Constraint override: setting driver %s vary=True (required by internal constraint).",
+                            drv_key,
+                        )
+                        params[drv_key].vary = True
+                tgt_key = fmt_pref(tgt)
+                if tgt_key in params and getattr(params[tgt_key], "vary", True) is False:                    
+                    log.warning(
+                        "Constraint override: setting target %s vary=True (required by internal constraint).",
+                        tgt_key,
+                    )
+                    params[tgt_key].vary = True
+
                 rule.apply_to_lmfit(
                     params=params,
-                    target_pref=target_pref,
-                    driver_peak=driver_peak,
-                    slice_states=slice_states
+                    registry=registry,
+                    allow_external=False,   # internal
+                    vary=vary,              # still pass through; rule may use it
                 )
             except Exception as e:
-                # Log but continue (defensive; validation should have caught this)
-                import logging
-                logging.getLogger("fit").warning(
-                    f"Failed to apply constraint for {fmt_pref(target_pref)}: {e}"
+                log.warning("Failed to apply internal constraint for %s: %s", fmt_pref(tgt), e)
+
+        # Apply EXTERNAL rules
+        for tgt, rule in rules_external:
+            try:
+                if vary:
+                    # Joint mode but cross-slice expr not supported in current architecture:
+                    log.warning(
+                        "Cross-slice constraint in joint mode is applied numerically (frozen) for %s. "
+                        "True joint cross-slice constraints require shared/global lmfit Parameters.",
+                        fmt_pref(tgt),
+                    )
+
+                rule.apply_to_lmfit(
+                    params=params,
+                    registry=registry,
+                    allow_external=True,   # external
+                    vary=vary,
                 )
+            except Exception as e:
+                log.warning("Failed to apply external constraint for %s: %s", fmt_pref(tgt), e)
+
+
 
 register_constraint_rule(ConstraintType.LINEAR, LinearConstraint)
 register_constraint_rule(ConstraintType.RELAX_EXP, RelaxDecayConstraint)

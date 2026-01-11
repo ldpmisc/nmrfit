@@ -296,7 +296,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
 
-        # we still want editing for Expr
+        #  still want editing for Expr
         self.tbl.setEditTriggers(
             QtWidgets.QAbstractItemView.DoubleClicked |
             QtWidgets.QAbstractItemView.EditKeyPressed |
@@ -681,7 +681,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                 self.tbl.setItem(row, self.COL_TARGET, tgt_item)
             tgt_item.setText(target_txt)
     
-            # type = LINEAR (we may overwrite to RELAX_EXP later)
+            # type = LINEAR ( may overwrite to RELAX_EXP later)
             type_item = self.tbl.item(row, self.COL_TYPE)
             if type_item is None:
                 type_item = QtWidgets.QTableWidgetItem()
@@ -754,7 +754,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                 times = getattr(parent, "t_f1", None)
             if times is None:
                 QtWidgets.QMessageBox.warning(self, "Exp template", "No slice times available from parent.")
-                # we can bail or continue with const t; here we bail
+                #  can bail or continue with const t; here  bail
                 return
 
         driver_txt = (tpl["driver"] or "").strip()
@@ -2452,84 +2452,7 @@ def _links_for_target_slice(links: "LinkStore", s: int) -> "LinkStore":
         ))
     return sub
 
-
-def _seed_external_drivers_into_registry(
-    *,
-    registry: dict["ParamRef", dict],
-    slice_states: dict[int, "SliceFitState"],
-    current_slice_id: int,
-    links: "LinkStore",
-    strict: bool = True,
-) -> None:
-    """
-    For each enabled link targeting current_slice_id whose driver lives in another slice,
-    inject the driver's current value (read-only) into the registry so LinkEngine can use it.
-    """
-    missing = []  # collect (driver_ref, reason)
-    # Collect targets in current slice
-    targets_here = {ex.target for ex in links.all_expr()
-                    if getattr(ex, "enabled", False)
-                    and getattr(ex, "target", None) is not None
-                    and int(ex.target.slice_id) == int(current_slice_id)} # set of targets
-
-    def _norm(n: str) -> str: return (n or "").strip().lower()
-
-    for expr in links.all_expr():
-        if not getattr(expr, "enabled", False):
-            continue
-        if getattr(expr, "type", None) != LinkType.LINEAR:
-            continue
-        t = getattr(expr, "target", None)
-        d = getattr(expr, "driver", None)
-        if t is None or d is None or t not in targets_here:
-            continue
-
-        ds, ts = int(d.slice_id), int(t.slice_id)
-        if ds == ts:
-            continue  # same-slice driver is already in the per-slice registry
-
-        other = slice_states.get(ds, None)
-        if other is None:
-            missing.append((d, f"slice_state[{ds}] not found"))
-            continue
-
-        # Check peak index exists
-        try:
-            pk = other.peaks[int(d.peak_id)]
-        except Exception:
-            missing.append((d, f"peak_id {d.peak_id} not present in slice {ds} "
-                               f"(len={len(getattr(other, 'peaks', []))})"))
-            continue
-
-        # Map parameter name → value
-        base = _norm(getattr(d, "name", ""))
-        try:
-            if base in ("amp", "area"):
-                val = float(pk.amp)
-            elif base in ("pos", "position", "freq", "hz", "ppm"):
-                val = float(pk.pos)
-            elif base in ("lor", "lorentz", "lor_hz"):
-                val = float(pk.lor_hz)
-            elif base in ("gauss", "gauss_disp", "gau"):
-                val = float(pk.gauss_disp)
-            else:
-                missing.append((d, f"unknown driver name '{d.name}'"))
-                continue
-        except Exception as ex:
-            missing.append((d, f"value read failed: {ex}"))
-            continue
-
-        # Seed read-only entry
-        if d not in registry:
-            registry[d] = {"value": val, "fixed": True, "bounds": (val, val)}
-
-    if strict and missing:
-
-        lines = []
-        for d, why in missing:
-            lines.append(f"- driver slice={d.slice_id} peak={d.peak_id} name={getattr(d, 'name', '?')}: {why}")
-        raise RuntimeError("Cross-slice driver seeding failed:\n" + "\n".join(lines))
-    
+   
 
 # -------------------------- Unit conversion. A fit uses Hz unit for pos, lor, gauss, and bound internally. ----------------------------
 def ppm_to_hz(x_ppm, ref: float):
@@ -2848,7 +2771,7 @@ def Peaks_to_ParamRefList(sid: int, peaks: List):
 
 def global_ref(sid: int, name: str) -> "ParamRef":
     # globals still follow the same rule by using peak_id = 000
-    return ParamRef(slice_id=int(sid), peak_id=000, name=str(name))
+    return ParamRef(slice_id=int(sid), peak_id=1000, name=str(name))
 
 def canon_name(n: str) -> str:
 
@@ -2873,41 +2796,6 @@ class FitContext:
         self.sw_hz = sw_hz
         self.orchestrator: Optional[FitOrchestrator] = None
         self.constraint_errors: List[ConstraintValidationError] = []
-
-    def set_orchestrator(self, orchestrator: Optional[FitOrchestrator]) -> None:
-        """Set FitOrchestrator for constraint management during fit."""
-        self.orchestrator = orchestrator
-        self.constraint_errors = []
-
-    def validate_constraints(self, peak_map: Dict[Tuple[int, int], Peak], 
-                           slice_states: Dict[int, "SliceFitState"]) -> List[ConstraintValidationError]:
-        """
-        Validate all constraints before fitting. Collects errors rather than raising.
-        Returns list of ConstraintValidationError; empty list if all valid.
-        """
-        if self.orchestrator is None:
-            return []
-        self.constraint_errors = self.orchestrator.validate_constraints(peak_map, slice_states)
-        return self.constraint_errors
-
-    def apply_constraints_to_lmfit(self, params: Parameters, peak_map: Dict[Tuple[int, int], Peak],
-                                   slice_states: Dict[int, "SliceFitState"], 
-                                   name_map: Optional[Dict[str, str]] = None) -> None:
-        """
-        Apply constraints to lmfit Parameters. Should be called after build_params().
-        Works in coordination with orchestrator to handle both same-slice (algebraic)
-        and cross-slice (numeric) constraints.
-        """
-        if self.orchestrator is None:
-            return
-        for param_name, rule in self.constraints.items():
-            if not rule.enabled:
-                continue
-            driver_peak = self._get_driver_peak(rule, slice_states)
-            value = rule.evaluate(self.peak, driver_peak, slice_states)
-            pref_tgt = ParamRef(self.slice_id, self.peak_id, param_name)
-            rule.apply_to_lmfit(params, pref_tgt, value)
-
 
     def build_params(self, peaks: List[Peak], sid: int, multiplier: float = 1.0, offset: float = 0.0, *, prefix: str = "") -> Parameters: 
         #Parameters always contains pos lor and gauss in Hz
@@ -3040,7 +2928,7 @@ class FitContext:
     
 def apply_bounds_to_param(par: Parameter, model, slice_id: int, peak_idx: int,
                           pref_name: str, axis_mode: str, ref_mhz: float):
-    """Look up and apply bounds for this parameter."""
+    """Look up and apply bounds for this parameter. To be moved to FitOrchestrator later."""
     if not model:
         return
     try:
@@ -3075,7 +2963,10 @@ def _T_bounds_to_k_bounds(T_lo, T_hi):
 
 def apply_Tbounds_to_param(par, lo: float | None, hi: float | None) -> None:
 
-    """Apply numeric bounds directly to an lmfit Parameter (no unit conversion)."""
+    """
+    Apply numeric bounds directly to an lmfit Parameter (no unit conversion). 
+    To be moved to FitOrchestrator later.
+    """
     if lo is not None:
         par.min = float(lo)
     if hi is not None:
@@ -4308,206 +4199,8 @@ class  MainWindow(QMainWindow):
     def clear_links(self) -> None:
         self.link_store.clear()
         self.peak_model.layoutChanged.emit()
+      
 
-    # C1: build registry for a slice
-    def _build_registry_for_slice(self, s: int) -> dict:
-        reg = {} #dict[ParamRef dict]
-        st = getattr(self, "slice_states", {}).get(s, None)
-        if not st:
-            return reg
-        for pid, pk in enumerate(st.peaks):
-            reg[ParamRef(s, pid, "pos")] = {'value': float(pk.pos), 'fixed': False, 'bounds': (-math.inf, math.inf)}
-            reg[ParamRef(s, pid, "amp")] = {'value': float(pk.amp), 'fixed': False, 'bounds': (0.0, math.inf)}
-            reg[ParamRef(s, pid, "lor")] = {'value': float(pk.lor_hz), 'fixed': False, 'bounds': (0.0, math.inf)}
-            reg[ParamRef(s, pid, "gauss")] = {'value': float(pk.gauss_disp), 'fixed': False, 'bounds': (0.0, math.inf)}
-        return reg
-    
-    # C2: scatter evaluated target values back into states
-    def _apply_links_to_slice_states(self, reg: dict) -> None:
-        for pref, entry in reg.items():
-            if not isinstance(pref, ParamRef):
-                continue
-            try:
-                val = float(entry['value'])
-            except Exception:
-                continue
-            st = getattr(self, "slice_states", {}).get(pref.slice_id, None)
-            if not st:
-                continue
-            try:
-                pk = st.peaks[pref.peak_id]
-            except Exception:
-                continue
-            if pref.name == "pos":       pk.pos = val
-            elif pref.name == "amp":     pk.amp = val
-            elif pref.name == "lor":     pk.lor_hz = val
-            elif pref.name == "gauss":     pk.gauss_disp = val
-            st.dirty_model = True
-
-
-    # C3: mark lmfit Parameters for linked targets in current slice
-    def _apply_links_to_lmfit(self, params, s: int, use_orchestrator: bool = False) -> None:
-        """
-        Resolve links for the current slice `s` and freeze linked targets in LMFit `params`.
-        
-        If use_orchestrator=True, attempts to use FitOrchestrator pattern (Phase 6 integration).
-        Falls back to LinkEngine.evaluate if orchestrator not available or not configured.
-        """
-        # Try orchestrator path first (Phase 6)
-        if use_orchestrator:
-            try:
-                if hasattr(self, '_fit_context') and self._fit_context and self._fit_context.orchestrator:
-                    # Build peak map for this slice
-                    peak_map = {}
-                    st = self.slice_states.get(int(s))
-                    if st:
-                        for pid, peak in enumerate(st.peaks):
-                            peak_map[(int(s), pid)] = peak
-                    
-                    # Apply constraints via orchestrator
-                    self._fit_context.apply_constraints_to_lmfit(
-                        params=params,
-                        peak_map=peak_map,
-                        slice_states=self.slice_states,
-                        name_map={
-                            "pos": "pos", "position": "pos", "freq": "pos",
-                            "amp": "amp", "area": "amp", "amplitude": "amp",
-                            "lor": "lor", "lorentz": "lor", "lorentz_hz": "lor",
-                            "gauss": "gauss", "gauss_disp": "gauss",
-                        }
-                    )
-                    return  # Success with orchestrator
-            except Exception as e:
-                log.warning("Orchestrator constraint application failed, falling back to LinkEngine: %s", e)
-        
-        # Fallback: Original LinkEngine-based approach
-        # 1) Build per-slice registry
-        reg = self._build_registry_for_slice(int(s))
-        # quick exit if nothing to do
-        try:
-            has_links = any(getattr(expr, "enabled", False) for expr in self.link_store.all_expr())
-        except Exception:
-            has_links = False
-        if not reg or not has_links:
-            return
-
-        # 2) Inject external drivers so LinkEngine can resolve cross-slice targets
-        _seed_external_drivers_into_registry(
-            registry=reg,
-            slice_states=self.slice_states,   # dict[int, SliceFitState]
-            current_slice_id=int(s),
-            links=self.link_store,
-            strict=True,
-        )
-
-        # 3a) Evaluate links (mutates reg[target]['value'])
-        links_subset = _links_for_target_slice(self.link_store, int(s))
-        #links = LinkStore instance, links_subset = LinkStore_subset, a smaller LinkStore, that concerns only about a given slice s
-          
-        slice_times = getattr(self, "t_f1", None)
-        # Thread time vector if present (needed for RELAX_EXP)
-        try:
-            _has_relax = any(ex.enabled and ex.type == LinkType.RELAX_EXP for ex in links_subset.all_expr())
-        except Exception:
-            _has_relax = False
-        if _has_relax and slice_times is None:
-            raise ValueError("RELAX_EXP link requires time data. Load time_echo.txt via File → Open Time.")
-
-        LinkEngine.evaluate(registry=reg, slice_times=slice_times, links=links_subset)
-
-        # 3b) Seed a shared T parameter for later joint-fitting (harmless in single-slice)
-        # Don't use it here for numeric freeze, but adding it once avoids surprises later.
-        if _has_relax and ("relax_T" not in params):
-        # conservative, positive default; user can tweak later
-            params.add("relax_T", value=1.0, min=1e-12)
-
-        if _has_relax and ("relax_C" not in params):
-            params.add("relax_C", value=0.0, vary=False)
-
-        # 4) Freeze linked targets in this slice in LMFit params (set value + vary=False)
-        #    Support a few common aliases for robustness.
-        def _norm(n: str) -> str: return (n or "").strip().lower()
-        name_map = {
-            "pos": "pos", "position": "pos", "freq": "pos", "pos_hz": "pos", "pos_ppm": "pos",
-            "amp": "amp", "area": "amp", "amplitude": "amp",
-            "lor": "lor", "lorentz": "lor", "lor_hz": "lor", "lorentz_hz": "lor",
-            "gauss": "gauss", "gauss_disp": "gauss",
-        }
-
-        for pref_tgt, entry in reg.items(): #pref_tgt is ParamRef instance
-            if not isinstance(pref_tgt, ParamRef):
-                continue
-            if int(pref_tgt.slice_id) != int(s):
-                continue
-            # only freeze if target is actually linked
-            if not self.link_store.is_linked(pref_tgt):
-                continue
-                       
-            base_tgt = name_map.get(_norm(pref_tgt.name))
-            if not base_tgt:
-                continue
-            key_tgt = f"{base_tgt}_{int(pref_tgt.peak_id)}"  # lmfit param names: pos_i, amp_i, lor_i, gauss_i
-            p_tgt = params.get(key_tgt, None)
-            if p_tgt is None:
-                continue
-
-            #fetch the link expression for this target            
-            linkexpr = links_subset.get(pref_tgt)
-
-            if getattr(linkexpr,"type", None) == LinkType.LINEAR and getattr(linkexpr,"driver", None) is not None:
-                pref_drv = linkexpr.driver
-                if int(pref_drv.slice_id) != int(s):
-                # cross-slice driver not present; freeze numeric
-                    try:
-                        p_tgt.set(value=float(entry["value"]), vary=False)
-                    except Exception:
-                        pass
-                    continue
-            
-                base_drv = name_map.get(_norm(pref_drv.name))
-                if not base_drv:
-                    continue
-                key_drv = f"{base_drv}_{int(pref_drv.peak_id)}"
-                if key_drv not in params:
-                    try:
-                        p_tgt.set(value=float(entry["value"]), vary=False)
-                    except Exception: pass
-                    continue
-
-                a = float(linkexpr.args.get("a", 1))
-                b = float(linkexpr.args.get("b", 0))
-                p_tgt.set(value=float(entry["value"]), expr=f"{key_drv}*{a}+{b}")
-
-            elif getattr(linkexpr, "type", None) == LinkType.RELAX_EXP:
-                # numeric freeze (no algebraic tie)
-                try:
-                    p_tgt.set(value=float(entry["value"]), vary=False)
-                except Exception:
-                    pass
-                
-
-    def _get_external_driver_slice(self, s: int) -> set[int]:
-        """
-        Return slice IDs that drive (via enabled LINEAR links) targets in slice `s`,
-        excluding `s` itself. Uses self.link_store.
-        """
-        out: set[int] = set()
-        links = getattr(self, "link_store", None)
-        if not links:
-            return out
-        for expr in links.all_expr():
-            if not getattr(expr, "enabled", False):
-                continue
-            if getattr(expr, "type", None) != LinkType.LINEAR:
-                continue
-            t = getattr(expr, "target", None)
-            d = getattr(expr, "driver", None)
-            if not t or not d:
-                continue
-            if int(t.slice_id) == int(s) and int(d.slice_id) != int(s):
-                out.add(int(d.slice_id))
-        return out
-    
     def _on_open_tseed_table(self):
         dlg = getattr(self, "_tseed_dlg", None)
         if dlg is None:
@@ -4718,7 +4411,7 @@ class  MainWindow(QMainWindow):
     # ------------------------- UI helpers ---------------------------------
     def on_axis_mode_changed(self, s: str):
         self.axis_mode = s.lower()
-        # If we have 2D data loaded, re-emit current slice to swap x-axis
+        # If  have 2D data loaded, re-emit current slice to swap x-axis
         if self.data2d is not None and self.data2d.shape[0] >= 1:
             self.display_slice(self.slice_index, preserve_view=True)
         else:
@@ -4747,7 +4440,7 @@ class  MainWindow(QMainWindow):
         self.x = x.astype(float)
         self.y = self.data2d[i, :].astype(float)
         self._update_slice_label()
-            # if we have a cache for this slice, restore table immediately
+            # if  have a cache for this slice, restore table immediately
         st = self.slice_states.get(int(self.slice_index)) #slice_states = dicts
 
         if st is not None and not getattr(st, "dirty_model", False):
@@ -4995,7 +4688,7 @@ class  MainWindow(QMainWindow):
 
         ax = self.canvas.ax
 
-        # 1) capture current limits if we want to preserve
+        # 1) capture current limits if  want to preserve
         if preserve_view:
             xlim, ylim = ax.get_xlim(), ax.get_ylim()
 
@@ -5356,7 +5049,7 @@ class  MainWindow(QMainWindow):
         try:
             view: QtWidgets.QTableView = self.tbl
 
-            # 1) If we're mid-edit, ask the view to end editing.
+            # 1) If mid-edit, ask the view to end editing.
             if view.state() == QtWidgets.QAbstractItemView.EditingState:
                 idx = view.currentIndex()
                 if idx.isValid():
@@ -5636,7 +5329,7 @@ class  MainWindow(QMainWindow):
         self.refresh_plot(preserve_view=True)
         self.update_ui_state()
 
-    def on_fit_current(self, *, allow_external_drivers: bool = False, status: bool = True):
+    def on_fit_current(self, *, allow_external_drivers: bool = False, vary: bool = True, status: bool = True):
         # 0) Guards (before busy)
         if self.x is None or self.y is None or self.peak_model.rowCount() == 0:
             QtWidgets.QMessageBox.warning(self, 'Fit', 'Load data and define at least one peak.')
@@ -5649,6 +5342,7 @@ class  MainWindow(QMainWindow):
             sid = int(getattr(self, "slice_index", 0))
             no_of_peaks = self._peaks_per_slice(int(getattr(self, "slice_index", 0)))
 
+
             # 2) Read other settings from the UI
             self.current_settings()
             mask_w = self._mask_from_excluded(self.x)
@@ -5656,83 +5350,87 @@ class  MainWindow(QMainWindow):
             # 3) Build context and LMFit params
             ctx = FitContext(self.x, self.y, self.axis_mode, self.ref, self.sw_hz)
             ctx.mask_w = mask_w
-            
-            # Phase 6: Setup FitOrchestrator if link_store has constraints to apply
-            # This enables validation before fitting
-            try:
-                if hasattr(self, 'link_store') and self.link_store:
-                    orchestrator = FitOrchestrator.from_link_store(self.link_store)
-                    ctx.set_orchestrator(orchestrator)
-            except Exception as e:
-                log.warning("Failed to create orchestrator from link_store: %s", e)
-            
+
+            # 3a) Build LMFit Parameters from peaks + globals
+
             params = ctx.build_params(peaks, sid, self.multiplier, self.offset) #params is a Paramters instance aka a dictionary
-
+            reg = FitOrchestrator.build_registry_for_slice(slice_id=sid, slice_states=self.slice_states, peaks_override=peaks)
+               
             # globals vary/freeze
-            params[f'{fmt_pref(global_ref(sid, "mult"))}'].set(vary=not self.fix_mult,    value=self.multiplier)
-            params[f'{fmt_pref(global_ref(sid, "phi0_deg"))}'].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params[f'{fmt_pref(global_ref(sid, "offset"))}'].set(vary=not self.fix_offset, value=self.offset)        
+                        
+            params[fmt_pref(global_ref(sid, "mult"))].set(vary=not self.fix_mult,    value=self.multiplier)
+            params[fmt_pref(global_ref(sid, "phi0_deg"))].set(vary=not self.fix_phi0, value=self.phi0_deg)
+            params[fmt_pref(global_ref(sid, "offset"))].set(vary=not self.fix_offset, value=self.offset)     
+             
+            # Build per-peak vary for lmfit from GUI fix flags. lmfit set vary = 1. GUI set fix = 1 to be consistent with ssnake
 
-            for i in range(len(peaks)):
-                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'],   self.peak_model, sid, i, "pos",   self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'], self.peak_model, sid, i, "gauss", self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'],   self.peak_model, sid, i, "amp",   self.axis_mode, self.ref)
-                apply_bounds_to_param(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'],   self.peak_model, sid, i, "lor",   self.axis_mode, self.ref)
+            for pid in range(len(peaks)):
+                fpos, famp, flor, fgauss = fix_flags[pid]
+                for name, flag in zip(["pos", "amp", "lor", "gauss"], [fpos, famp, flor, fgauss]):
+                    pref = ParamRef(sid, pid, name)
+                    if fmt_pref(pref) in params:
+                        params[fmt_pref(pref)].vary   = not flag
+           
+            # Apply bounds from peak model if any. Move to FitOrchestrator later
+       
+            for pid in range(len(peaks)):
+                for pname in ["pos", "amp", "lor", "gauss"]:
+                    pref = ParamRef(sid, pid, pname)
+                    param_key = fmt_pref(pref)
+                    if param_key in params:
+                        apply_bounds_to_param(params[param_key], self.peak_model, sid, pref.peak_id, pref.name, self.axis_mode, self.ref)
 
-            for i in range(len(peaks)):
-                b_lor = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="lor")) if self.peak_model else None
-                if not (b_lor and b_lor.is_set()):
-                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].min = 0.0
-                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].max = 10000.0
+                    # Apply fallback bounds for parameters without user-set bounds                    
+                    if pref.name in ("lor", "gauss"):
+                        b = self.peak_model.get_bounds_for(pref) if self.peak_model else None
+                        if not (b and b.is_set()) and param_key in params:
+                            params[param_key].min = 0.0
+                            params[param_key].max = 10000
+                    elif pref.name == "amp":
+                        b_amp = self.peak_model.get_bounds_for(pref) if self.peak_model else None
+                        if not (b_amp and b_amp.is_set()) and param_key in params:
+                            params[param_key].min = 0.0
+            
 
-                b_g = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="gauss")) if self.peak_model else None
-                if not (b_g and b_g.is_set()):
-                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].min = 0.0
-                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].max = 10000
-
-                b_a = self.peak_model.get_bounds_for(ParamRef(slice_id=sid, peak_id=i, name="amp")) if self.peak_model else None
-                if not (b_a and b_a.is_set()):
-                    params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].min = 0.0
-
-            # 4) Apply per-peak vary for lmfit from GUI fix flags. lmfit set vary = 1. GUI set fix = 1 to be consistent with ssnake
-            for i in range(len(peaks)):
-                fpos, famp, flor, fgauss = fix_flags[i]
-                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="pos"))}'].vary   = not fpos
-                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="amp"))}'].vary   = not famp
-                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].vary   = not flor
-                params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].vary = not fgauss
-
-            # 5) Resolve links for THIS slice: seed external drivers + evaluate + freeze linked targets
-            s = int(getattr(self, "slice_index", 0))
-            ext_drv = self._get_external_driver_slice(s)
-            if ext_drv and not allow_external_drivers:
-                # Note: error messege
-                msg = ("This slice has parameters driven by other slice(s): "
-                       f"{sorted(ext_drv)}.\n"
-                       "Please use ‘Fit Selected…’, include the driver slice(s), "
-                       "and choose Sequential or Joint mode.")
-                QtWidgets.QMessageBox.information(self, "Cross-slice driver detected", msg)
-                return  # finally{} will _end_busy()
-
+            # 3b) Create orchestrator if constraint store exists
+            orchestrator: Optional[FitOrchestrator] = None
             try:
-                self._apply_links_to_lmfit(params, s)
+                store = getattr(self, 'constraint_store', None)
+                if store is not None:
+                    orchestrator = FitOrchestrator(constraint_store=store)
             except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Link error", str(e))
-                return  # finally{} will end_busy()
+                log.warning('Failed to initialize FitOrchestrator: %s', e) 
 
-            # Phase 6A: Validate constraints before fitting
-            # Build peak map for validation
-            peak_map = {(sid, i): peaks[i] for i in range(len(peaks))}
-            constraint_errors = ctx.validate_constraints(peak_map, self.slice_states)
-            if constraint_errors:
-                error_msg = "Constraint validation errors:\n\n"
-                for error in constraint_errors:
-                    error_msg += f"• {error.target_pref}: {error.message}\n"
-                QtWidgets.QMessageBox.warning(self, "Constraint Validation Failed", error_msg)
-                return  # finally{} will _end_busy()
+            # Phase 6B: Validate constraints BEFORE applying
+            if orchestrator:
+                peak_map = {(sid, i): peaks[i] for i in range(len(peaks))}
+                constraint_errors = orchestrator.validate_constraints(peak_map, self.slice_states)
+                if constraint_errors:
+                    error_msg = "Constraint validation errors:\n\n"
+                    for error in constraint_errors:
+                        error_msg += f"• {fmt_pref(error.target_pref)}: {error.message}\n"
+                    QtWidgets.QMessageBox.warning(self, "Constraint Validation Failed", error_msg)
+                    return  # finally{} will _end_busy()
+
+            # Phase 6B: Apply constraints via orchestrator
+            if orchestrator:
+                try:
+                    # current-slice fit => sequential mode hint (vary=False)
+                    orchestrator.apply_constraints_to_lmfit(
+                        params=params,
+                        registry=reg,
+                        slice_states=self.slice_states,
+                        slice_id=sid,
+                        allow_external=bool(allow_external_drivers),
+                        vary=bool(vary),
+                        strict_external_seed=True,
+                    )
+
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Constraint Application Error", str(e))
+                    return  # finally{} will end_busy()
 
             # 6) Fit
-
             try:
                 result = minimize(
                     lambda p: ctx.residual(p, no_of_peaks, sid),
@@ -5805,8 +5503,8 @@ class  MainWindow(QMainWindow):
             except Exception: pass
 
             # 10) Save ONLY this slice and refresh
-            self._save_slice_state(s, has_fit=True)
-            st = self.slice_states.get(s)
+            self._save_slice_state(sid, has_fit=True)
+            st = self.slice_states.get(sid, None)
             if st is not None:
                 self.refresh_plot_from_state(st, preserve_view=True)
                 st.state_stats = self.fit_stats
@@ -5870,7 +5568,7 @@ class  MainWindow(QMainWindow):
         selected = set(int(s) for s in indices)
         missing: set[int] = set()
         for t in selected:
-            missing |= self._get_external_driver_slice(t)
+            missing |= self.get_external_driver_slice(t)
         missing -= selected
         if missing:
             QtWidgets.QMessageBox.information(
@@ -5899,7 +5597,7 @@ class  MainWindow(QMainWindow):
                 if not self._bind_slice_direct(k):
                     continue
                 self.on_slice_spin_changed(k)
-                self.on_fit_current(allow_external_drivers=True, status=False)
+                self.on_fit_current(allow_external_drivers=True, vary=False, status=False)
                 fitted.append(k)
         finally:
             self.statusBar().showMessage(
@@ -6091,7 +5789,89 @@ class  MainWindow(QMainWindow):
             try: self._end_busy()
             except Exception: pass
 
+    def _seed_external_drivers_into_registry(
+        self,
+        *,
+        registry: Dict[ParamRef, Dict[str, Any]],
+        slice_states: Dict[int, Any],
+        target_slice_id: int,
+        enabled_only: bool = True,
+        strict: bool = True,
+    ) -> Set[ParamRef]:
+        """
+        For enabled constraints targeting target_slice_id whose driver lives in another slice,
+        inject the driver's numeric value into registry.
 
+        Returns:
+          Set of external (cross-slice) driver ParamRefs required by constraints targeting this slice.
+        """
+        sid = int(target_slice_id)
+        missing: List[Tuple[ParamRef, str]] = []
+        external: Set[ParamRef] = set()
+
+        # 1) Collect external drivers needed for rules targeting this slice
+        for tgt, rule in self.constraint_store.all_constraints():
+            if enabled_only and not getattr(rule, "enabled", True):
+                continue
+            if int(tgt.slice_id) != sid:
+                continue
+
+            drv = getattr(rule, "driver_pref", None)
+            if drv is None:
+                continue
+
+            if int(drv.slice_id) != int(tgt.slice_id):
+                external.add(drv)
+
+        if not external:
+            return set()
+
+        # 2) Canonical mapping name -> Peak attribute
+        # No normalization/synonyms: upstream must ensure ParamRef.name is canonical.
+        name_to_attr = {"pos": "pos", "amp": "amp", "lor": "lor_hz", "gauss": "gauss_disp",}
+
+        # 3) Seed values
+        for drv in external:
+            # Preserve any caller-provided value
+            if drv in registry and "value" in (registry.get(drv) or {}):
+                continue
+
+            ds = int(drv.slice_id)
+            st = (slice_states or {}).get(ds)
+            if st is None:
+                missing.append((drv, f"slice_states[{ds}] not found"))
+                continue
+
+            peaks = getattr(st, "peaks", None)
+            if not peaks:
+                missing.append((drv, f"slice_states[{ds}].peaks missing/empty"))
+                continue
+
+            try:
+                pk = peaks[int(drv.peak_id)]
+            except Exception:
+                missing.append((drv, f"peak_id {drv.peak_id} not present in slice {ds} (len={len(peaks)})"))
+                continue
+
+            pname = getattr(drv, "name", None)
+            attr = name_to_attr.get(pname)
+            if attr is None:
+                missing.append((drv, f"non-canonical ParamRef.name '{pname}' (expected one of {sorted(name_to_attr)})"))
+                continue
+
+            try:
+                val = float(getattr(pk, attr))
+            except Exception as ex:
+                missing.append((drv, f"value read failed for attr '{attr}': {ex}"))
+                continue
+
+            registry[drv] = {"value": val}
+
+        if strict and missing:
+            lines = [f"- driver {fmt_pref(drv)}: {why}" for drv, why in missing]
+            raise RuntimeError("Cross-slice driver seeding failed:\n" + "\n".join(lines))
+
+        return external
 
     def _build_joint_params(self, indices):
         """
@@ -6233,8 +6013,8 @@ class  MainWindow(QMainWindow):
 
         for sid in joint_slices:
             try:
-                reg = self._build_registry_for_slice(sid)
-                _seed_external_drivers_into_registry(
+                reg_ = FitOrchestrator.build_registry_for_slice(sid)._
+                reg = reg_._seed_external_drivers_into_registry(
                     registry=reg,
                     slice_states=self.slice_states,
                     current_slice_id=sid,
@@ -6502,7 +6282,7 @@ class  MainWindow(QMainWindow):
         if not hasattr(self, "_TSeedRegistry"):
             self._TSeedRegistry = {}
         rec = self._TSeedRegistry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
-        # We store the provided seed; 'use_flag' from old API maps to not-fixed seeding.
+        # store the provided seed; 'use_flag' from old API maps to not-fixed seeding.
         rec["T_seed_s"] = float(T_seconds) if (T_seconds and T_seconds > 0) else None
         # If the user asked to "use for next fits", keep varying (fixed=False); else consider fixing.
         rec["fixed"] = False if bool(use_flag) else rec.get("fixed", False)
@@ -6571,7 +6351,7 @@ class  MainWindow(QMainWindow):
 
         src_sid = int(getattr(self, "slice_index", 0))
 
-        # Determine how many slices we have (same logic as on_copy_params)
+        # Determine how many slices same logic as on_copy_params
         if data2d is not None and hasattr(data2d, "shape") and data2d.ndim == 2:
             n_traces = int(data2d.shape[0])
         else:
