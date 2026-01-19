@@ -69,7 +69,7 @@ import math
 import io
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any, Iterable, Set
+from typing import Callable, List, Mapping, Optional, Sequence, Tuple, Dict, Any, Iterable, Set
 from enum import Enum, auto
 from pathlib import Path
 from datetime import datetime
@@ -95,18 +95,21 @@ from PyQt5.QtGui import QDoubleValidator
 
 from stats_extract import extract_FitResult_corr_and_sum
 from stats_view import StatsView
+from fit_types import ParamRef, ParamBounds
 from constraint_rules import (
-    ParamRef,
+    CONSTRAINT_RULE_REGISTRY,
     ConstraintType,
     ConstraintRule,
     LinearConstraint,
+    ParseContext,
     RelaxDecayConstraint,
     LinkExpr_to_ConstraintRule,
     ConstraintRule_to_LinkExpr,
     ConstraintStore,
     ConstraintValidationError,
     FitOrchestrator,
-    fmt_pref, txt_to_pref, row_to_rule, resolve_constraint_type, pref_equal
+    fmt_pref,
+    is_float, txt_to_pref, dispatch_rule_from_ui, resolve_constraint_type, pref_equal
 )
 
 import os
@@ -187,14 +190,14 @@ class SliceFitState:
 
 class LinkType(Enum):
     LINEAR = auto()       # target = a * driver + b
-    RELAX_EXP = auto()    # target(i) = driver * A * exp(-t_i / T) + C
+    RELAX_DECAY = auto()    # target(i) = driver * A * exp(-t_i / T) + C
 
 
 @dataclass
 class LinkExpr:  # LinkExpr aka math expression of the link
     target: ParamRef
     driver: Optional[ParamRef]   
-    args: Dict[str, float]       # LINEAR: {a,b}; RELAX_EXP: {A,T,t_override,C}
+    args: Dict[str, float]       # LINEAR: {a,b}; RELAX_DECAY: {A,T,t_override,C}
     enabled: bool = True
     
     @property
@@ -203,7 +206,7 @@ class LinkExpr:  # LinkExpr aka math expression of the link
         if "a" in self.args or "b" in self.args:
             return "LINEAR"
         elif "A" in self.args or "T" in self.args or "T_name" in self.args:
-            return "RELAX_EXP"
+            return "RELAX_DECAY"
         return "LINEAR"  # default
 
 class LinkStore:
@@ -272,16 +275,16 @@ class LinkManagerDialog(QtWidgets.QDialog):
     COL_TYPE    = 2
     COL_DRIVER  = 3
     COL_EXPR    = 4
-    def __init__(self, parent, link_store: LinkStore, *, slice_count: int = 1, peaks_per_slice: int = 1,
-                 constraint_store: Optional[Any] = None):
+    def __init__(self, parent, *, slice_count: int = 1, peaks_per_slice: int = 1,
+                 constraint_store: Optional[Any] = None, time_for_slice: Optional[Callable[[int], Optional[Any]]] = None):
         super().__init__(parent)
         self.setWindowTitle("Link Manager")
         self.resize(1000, 700)
-        self._link_store = link_store
         self._constraint_store = constraint_store
         self._slice_count = slice_count
         self._peaks_per_slice = peaks_per_slice
         self._row_targets: list[ParamRef] = []
+        self._time_for_slice = time_for_slice
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -388,7 +391,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     # --------------- UI helpers ---------------
     def _norm_type(self, t: str) -> str:
         t = (t or "").strip().upper()
-        return t if t in ("LINEAR", "RELAX_EXP") else "LINEAR"
+        return t if t in ("LINEAR", "RELAX_DECAY") else "LINEAR"
 
     def _target_pref_from_row(self, row: int):
         self._ensure_row_targets_len(row)
@@ -517,7 +520,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                 expr_item = QtWidgets.QTableWidgetItem()
                 self.tbl.setItem(row, self.COL_EXPR, expr_item)
 
-            expr_txt = rule.rule_to_expr()            
+            expr_txt = rule.to_display_expr()            
             expr_item.setText(expr_txt)
 
         finally:
@@ -681,7 +684,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                 self.tbl.setItem(row, self.COL_TARGET, tgt_item)
             tgt_item.setText(target_txt)
     
-            # type = LINEAR ( may overwrite to RELAX_EXP later)
+            # type = LINEAR ( may overwrite to RELAX_DECAY later)
             type_item = self.tbl.item(row, self.COL_TYPE)
             if type_item is None:
                 type_item = QtWidgets.QTableWidgetItem()
@@ -722,7 +725,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
 
     def _apply_exp_template_to_rows(self, rows: list[int]) -> None:
         """
-        Turn the given rows (which already have targets) into RELAX_EXP links
+        Turn the given rows (which already have targets) into RELAX_DECAY links
         using A/C/T from a small dialog and t from:
             - parent.t_f1    (if present)
             - parent.on_open_time() → parent.t_f1
@@ -801,7 +804,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
             if type_item is None:
                 type_item = QtWidgets.QTableWidgetItem()
                 self.tbl.setItem(r, self.COL_TYPE, type_item)
-            type_item.setText("RELAX_EXP")
+            type_item.setText("RELAX_DECAY")
 
             # driver cell (if user gave driver)
             if driver_txt:
@@ -967,7 +970,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         enabled = self._enabled_from_cell(row)
 
         # 1) expr empty => not ready
-        if expr_txt == "":
+        if expr_txt == "": 
             return
 
         expr_item = self.tbl.item(row, self.COL_EXPR)
@@ -977,26 +980,36 @@ class LinkManagerDialog(QtWidgets.QDialog):
         if drv_item is not None:
             self._clear_error(drv_item)
 
-        # 2) Driver resolution + mismatch check for LINEAR
-        #    (Driver can be inferred from expr; if driver cell is present, it must match.)
+        # 2) Driver resolution + mismatch check
+        #    (Driver can be inferred from expr; if driver cell is present, it must match.) 
+
         try:
             ct = resolve_constraint_type(type_txt)
         except Exception as e:
             if expr_item is not None:
                 self._mark_error(expr_item, f"Invalid constraint type '{type_txt}': {e}")
             return
+        
+        rule_cls = CONSTRAINT_RULE_REGISTRY.get(ct)
+        if rule_cls is None or not hasattr(rule_cls, "infer_driver_from_expr"):
+            return
+        
+        try:
+            driver_txt_from_expr = rule_cls.infer_driver_from_expr(expr_txt)
+        except Exception as e:
+            if expr_item is not None:
+                self._mark_error(expr_item, str(e))
+            return
 
-        if ct == ConstraintType.LINEAR:
+        if driver_txt_from_expr:
             try:
-                # parse driver token from expr (does NOT commit)
-                _a, _b, drv_txt_from_expr = LinearConstraint.parse_UItext(expr_txt)
-                drv_pref_from_expr = txt_to_pref(drv_txt_from_expr)
+                drv_pref_from_expr = txt_to_pref(driver_txt_from_expr)
             except Exception as e:
                 if expr_item is not None:
-                    self._mark_error(expr_item, str(e))
-                return
+                    self._mark_error(expr_item, f"Failed to parse inferred driver '{driver_txt_from_expr}': {e}")
+                return      
 
-            # if driver cell empty, fill it from expr (optional but improves UX + consistency)
+            # if driver cell empty, fill it from expr
             if driver_txt == "" or driver_txt.strip().lower() == "(none)":
                 if drv_item is not None:
                     self._set_cell_text_blocked(row, self.COL_DRIVER, fmt_pref(drv_pref_from_expr))
@@ -1009,7 +1022,6 @@ class LinkManagerDialog(QtWidgets.QDialog):
                     if drv_item is not None:
                         self._mark_error(drv_item, str(e))
                     return
-
                 if not pref_equal(drv_pref_from_cell, drv_pref_from_expr):
                     msg = (
                         f"Driver mismatch: driver cell '{fmt_pref(drv_pref_from_cell)}' "
@@ -1022,17 +1034,37 @@ class LinkManagerDialog(QtWidgets.QDialog):
                     return
 
         # 3) If everything is ok and target is available, convert row -> rule
-        #    row_to_rule may still raise for truly invalid expr; catch and mark.
+        #    dispatch_rule_from_ui may still raise for truly invalid expr; catch and mark.
         target_pref = self._row_targets[row]
         if target_pref is None:
             return
+        
+        # build ParseContext
+        mw = self.parent()
+        reg = mw._Tseed_registry
+        if not isinstance(reg, Mapping):
+            if expr_item is not None:
+                self._mark_error(expr_item, f"Internal error: _Tseed_registry is {type(reg).__name__}, expected Mapping")
+            return
+
+        ctx = ParseContext(
+            time_for_slice=self._time_for_slice,
+            Tseed_registry=reg,
+            ensure_tseed_row=getattr(mw, "_ensure_tseed_row", None),
+            require_positive_T=True,
+            require_positive_time=False,
+            # Numerical guard
+            eps=1e-15,
+        )
+
         try:
-            rule = row_to_rule(
+            rule = dispatch_rule_from_ui(
                 target_pref=target_pref,
                 type_txt=type_txt,
                 driver_txt=driver_txt,
                 expr_txt=expr_txt,
                 enabled=enabled,
+                ctx=ctx
             )
         except Exception as e:
             if expr_item is not None:
@@ -1117,6 +1149,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
             peaks_per_slice=int(self._peaks_per_slice_provider()),
             link_store=self._link_store,
             constraint_store=self._constraint_store,
+            time_for_slice=self._time_for_slice,
         )
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
 
@@ -1127,7 +1160,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                     self._constraint_store.add_constraint(new_rule)
                     self._reload()
 
-                # If the expr is RELAX_EXP with T_name, ensure a registry row exists.
+                # If the expr is RELAX_DECAY with T_name, ensure a registry row exists.
                 try:
                     if new_rule and isinstance(new_rule, RelaxDecayConstraint):
                         Tn = new_rule.T_name  # Direct attribute access, not .args dict
@@ -1414,15 +1447,15 @@ class LinkManagerDialog(QtWidgets.QDialog):
             pref = txt_to_pref(row["target"]) if row["target"] else None
             self._row_targets.append(pref)
 
-            # Rebuild global ConstraintStore using row_to_rule factory
+            # Rebuild global ConstraintStore using dispatch_rule_from_ui factory
             if pref is not None:
-                type_txt = self._norm_type(row["type"])  # "LINEAR" / "RELAX_EXP"
+                type_txt = self._norm_type(row["type"])  # "LINEAR" / "RELAX_DECAY"
                 expr_txt = (row["expr"] or "").strip()
                 driver_txt = row["driver"] if row["driver"] else None
                 
-                # Use row_to_rule factory from constraint_rules.py
+                # Use dispatch_rule_from_ui factory from constraint_rules.py
                 try:
-                    constraint_rule = row_to_rule(
+                    constraint_rule = dispatch_rule_from_ui(
                         target_pref=pref,
                         type_txt=type_txt,
                         driver_txt=driver_txt,
@@ -1455,7 +1488,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                     except Exception:
                         pass
                     
-                    # If RELAX_EXP with T_name, ensure registry row exists
+                    # If RELAX_DECAY with T_name, ensure registry row exists
                     if isinstance(constraint_rule, RelaxDecayConstraint):
                         try:
                             Tn = getattr(constraint_rule, "T_name", None)
@@ -1737,23 +1770,16 @@ class LinkEditorDialog(QtWidgets.QDialog):
                  target: ParamRef,
                  slice_count: int,
                  peaks_per_slice: int,
-                 link_store: LinkStore,
                  constraint_store: Optional[Any] = None,
+                 time_for_slice: Optional[Callable[[int], Optional[Any]]] = None,
+                 Tseed_registry: Optional[Mapping[str, float]] = None,
                  default_is_linear: bool = True):
         super().__init__(parent)
         self.setWindowTitle("Edit Link")
         self._target = target
-        self._link_store = link_store
         self._constraint_store = constraint_store
-
-        # Try to get per-slice times from parent (t_f1 or slice_times)
-        self._times = None
-        try:
-            self._times = getattr(parent, "t_f1", None)
-            if self._times is None:
-                self._times = getattr(parent, "slice_times", None)
-        except Exception:
-            self._times = None
+        self._time_for_slice = time_for_slice
+        self._Tseed_registry = Tseed_registry
 
         layout = QtWidgets.QFormLayout(self)
 
@@ -1763,7 +1789,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
         # Link type
         self.cmb_type = QtWidgets.QComboBox()
         self.cmb_type.addItem("Linear (target = driver*a + b)", "LINEAR")
-        self.cmb_type.addItem("Time decay (target = driver*A*exp(-t/T)+C)", "RELAX_EXP")
+        self.cmb_type.addItem("Time decay (target = driver*A*exp(-t/T)+C)", "RELAX_DECAY")
         self.cmb_type.setCurrentIndex(0 if default_is_linear else 1)
         layout.addRow("Type:", self.cmb_type)
 
@@ -1800,7 +1826,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
         self._lbl_exp_args = QtWidgets.QLabel("Exponential args:")
         layout.addRow(self._lbl_exp_args)
 
-        # ---------------- RELAX_EXP (new UI) ----------------
+        # ---------------- RELAX_DECAY (new UI) ----------------
         # A spin
         self.spn_A = QtWidgets.QDoubleSpinBox()
         self.spn_A.setDecimals(3)
@@ -1828,7 +1854,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
         T_col = QtWidgets.QVBoxLayout()
         self.edt_T = QtWidgets.QLineEdit()
         self.edt_T.setPlaceholderText("e.g., T_1  (name → shared parameter)  or  0.0123  (fixed)")
-        self.lbl_T_hint = QtWidgets.QLabel("Use a meaningful name like T_1. Numbers create a fixed T for this link.")
+        self.lbl_T_hint = QtWidgets.QLabel("Use a meaningful name like T_1. Numbers create a fixed T for this constraint.")
         self.lbl_T_hint.setStyleSheet("color: gray;")
         T_col.addWidget(self.edt_T); T_col.addWidget(self.lbl_T_hint)
         self._w_T = QtWidgets.QWidget(); self._w_T.setLayout(T_col)
@@ -1878,23 +1904,19 @@ class LinkEditorDialog(QtWidgets.QDialog):
     # ---------- helpers ----------
     def _prefill_time_from_file(self):
         """Prefill t from loaded times if available; convert to chosen unit (default s)."""
-        # don't swallow everything silently
-        if self._times is None:
+        if self._time_for_slice is None:
             # print("no times on parent")
             return
     
         sid = int(self._target.slice_id)
-        # robust against "dialog opened for slice not in time file"
-        if not hasattr(self._times, "__len__"):
-            # print("times is not indexable:", type(self._times))
+        raw = self._time_for_slice(sid)
+        if raw is None:
             return
-    
-        n = len(self._times)
-        if sid < 0 or sid >= n:
-            # print(f"time not available for slice {sid}; array has {n} entries")
+        try:
+            t_sec = float(raw)
+        except Exception:
             return
-    
-        t_sec = float(self._times[sid])
+
         if self.cmb_t_unit.currentText() == "ms":
             self.spn_t.setValue(t_sec * 1e3)
         else:
@@ -1970,8 +1992,8 @@ class LinkEditorDialog(QtWidgets.QDialog):
         return (norm, True)
 
     def _update_preview(self):
-        # Only for RELAX_EXP
-        if self.cmb_type.currentData() != ConstraintType.RELAX_EXP:
+        # Only for RELAX_DECAY
+        if self.cmb_type.currentData() != ConstraintType.RELAX_DECAY:
             self.lbl_prev_human.setText("")
             self.lbl_prev_engine.setText("")
             return
@@ -2047,28 +2069,31 @@ class LinkEditorDialog(QtWidgets.QDialog):
             if rule.T_name:
                 self.edt_T.setText(str(rule.T_name))
             else:
-                self.edt_T.setText(f"{float(rule.T_seconds):.6g}")
+                self.edt_T.setText(f"{float(rule.T_number):.6g}")
 
             # Restore C
             self.spn_C.setValue(float(rule.C))
 
             # Restore t override
-            if rule.time_seconds is not None:
-                t_sec = float(rule.time_seconds)
+            if rule.time_s is not None:
+                t_sec = float(rule.time_s)
                 if self.cmb_t_unit.currentText() == "ms":
                     self.spn_t.setValue(t_sec * 1e3)
                 else:
                     self.spn_t.setValue(t_sec)
-            elif self._times is not None:
+            elif self._time_for_slice is not None:
                 sid = int(self._target.slice_id)
+                raw = self._time_for_slice(sid) # can be None or value
+                if raw is None:
+                    return
                 try:
-                    t_sec = float(self._times[sid])
-                    if self.cmb_t_unit.currentText() == "ms":
-                        self.spn_t.setValue(t_sec * 1e3)
-                    else:
-                        self.spn_t.setValue(t_sec)
+                    t_sec = float(raw)
                 except Exception:
-                    pass
+                    return
+                if self.cmb_t_unit.currentText() == "ms":
+                    self.spn_t.setValue(t_sec * 1e3)
+                else:
+                    self.spn_t.setValue(t_sec)
             
             if rule.driver_pref:
                 self.cmb_drv_slice.setValue(int(rule.driver_pref.slice_id))
@@ -2084,99 +2109,87 @@ class LinkEditorDialog(QtWidgets.QDialog):
     # ---------- result ----------
     def result_rule(self) -> Optional[ConstraintRule]:
         """
-        Return a ConstraintRule subclass (new pattern).
-        
-        This replaces result_expr() and outputs domain objects instead of
-        LinkExpr for better separation of concerns.
+        Create a ConstraintRule.
+
+        LinkEditor policy (similar to LinkManager try_commit_row):
+          - Build ParseContext (time provider from parent.t_f1/slice_times; T registry from parent._TSeedRegistry).
+          - LINEAR: construct directly.
+          - RELAX_DECAY: build canonical expr_txt (driver + A/C + t + T) and call dispatch_rule_from_ui(..., ctx).
+            -> interpret_ui() will parse t override from expr_txt and fallback to ctx.time_for_slice.
         """
-        drv_pref = ParamRef(self.cmb_drv_slice.value(),
-                           self.cmb_drv_peak.value(),
-                           COLUMN_NAMES[self.cmb_drv_param.currentIndex()].lower())
-        
-        t = self.cmb_type.currentData()
-        
-        if t == "LINEAR":
-            # Check for cycles using LinkStore if available
-            if self._link_store is not None:
-                try:
-                    rev = self._link_store.get(drv_pref)
-                    if rev and rev.driver == self._target:
-                        # Check if rev is also linear to detect cycle
-                        try:
-                            rev_rule = LinkExpr_to_ConstraintRule(rev)
-                            if isinstance(rev_rule, LinearConstraint):
-                                QtWidgets.QMessageBox.warning(self, "Invalid link",
-                                        "This would create a cycle: the driver is already linked back to the target.")
-                                return None
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            
-            # Create constraint and generate expr_txt for display
+        # 0) Driver pref, enabled
+        drv_pref = ParamRef(
+            self.cmb_drv_slice.value(),
+            self.cmb_drv_peak.value(),
+            COLUMN_NAMES[self.cmb_drv_param.currentIndex()].lower(),
+        )
+
+        driver_txt = fmt_pref(drv_pref)
+        type_txt = self.cmb_type.currentData()
+
+        # 1) Build ParseContext from parent (same pattern as _try_commit_row)
+        mw = self.parent()
+
+        ctx = ParseContext(
+            time_for_slice=self._time_for_slice,
+            Tseed_registry=self._Tseed_registry,
+            ensure_tseed_row=getattr(mw, "_ensure_tseed_row", None),
+            require_positive_T=True,
+            require_positive_time=False,
+            eps=1e-15,
+        )
+
+        # 2) LINEAR path (no parsing needed)
+        if type_txt == "LINEAR":
             linear_rule = LinearConstraint(
                 target_pref=self._target,
                 driver_pref=drv_pref,
                 a=float(self.edt_a.value()),
                 b=float(self.edt_b.value()),
-                enabled=self.chk_enabled.isChecked()
+                enabled=self.chk_enabled.isChecked(),
             )
-            # Generate expr_txt using rule_to_expr() so it displays in LinkManagerDialog
-            linear_rule.expr_txt = linear_rule.rule_to_expr()
+            linear_rule.expr_txt = linear_rule.to_display_expr()
             return linear_rule
 
-        # RELAX_EXP
-        elif t == "RELAX_EXP":
-            # Validate A
+        # 3) RELAX_DECAY path: build expr_txt then dispatch
+        if type_txt == "RELAX_DECAY":
             A_val = float(self.spn_A.value())
-
-            # T: named or numeric
-            T_text = (self.edt_T.text() or "").strip()
-            T_name_norm = self._normalize_T_name(T_text)
-            T_seconds = None
-            T_name = None
-            
-            if T_name_norm:
-                T_name = T_name_norm
-            else:
-                # must be numeric
-                try:
-                    T_seconds = float(T_text)
-                except Exception:
-                    QtWidgets.QMessageBox.warning(self, "Invalid T", "Enter a T name (e.g., T_1) or a numeric value.")
-                    return None
-            
-            if T_seconds is None:
-                T_seconds = 1.0  # default fallback if T_name is used
-
-            # C
             C_val = float(self.spn_C.value())
 
-            # t override (store only if user edited or no file)
-            t_sec = self._current_t_seconds()
-            time_override = None
-            if (self._times is None) or (t_sec > 0):
-                time_override = float(t_sec)
+            # time: prefer UI value; include it in expr_txt as t=... so parse_UItext sees it
+            t_sec = float(self._current_t_seconds())
 
-            # Build expression text for display in LinkManagerDialog
-            drv_txt = fmt_pref(drv_pref)
-            T_term = T_name if T_name else str(T_seconds)
-            t_val = time_override if time_override is not None else "t"
-            expr_txt = f"{drv_txt}*{A_val}*exp(-{t_val}/{T_term})+{C_val}"
+            # T term: name or numeric
+            T_term = (self.edt_T.text() or "").strip()
+            if not T_term:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid T",
+                    "Enter a T name (e.g., T_1) or a numeric value (seconds).",
+                )
+                return None
 
-            return RelaxDecayConstraint(
-                target_pref=self._target,
-                driver_pref=drv_pref,
-                T_seconds=T_seconds,
-                A=A_val,
-                C=C_val,
-                time_seconds=time_override,
-                T_name=T_name,
-                expr_txt=expr_txt,
-                enabled=self.chk_enabled.isChecked()
-            )
-        
-        return None
+            expr_txt = f"{A_val}*{driver_txt}*exp(-{t_sec}/{T_term})+{C_val}"
+            try:
+                relax_decay_rule = RelaxDecayConstraint.interpret_ui(
+                    target_pref=self._target,
+                    driver_txt=driver_txt,
+                    expr_txt=expr_txt,
+                    enabled=self.chk_enabled.isChecked(),
+                    ctx=ctx,
+                )
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Invalid link", str(e))
+                return None
+
+            if relax_decay_rule is None:
+                return None
+
+            # ensure expr_txt stored for display (dispatch/interpret_ui should already set it,
+            # but keep it explicit)
+            relax_decay_rule.expr_txt = relax_decay_rule.to_display_expr()
+            return relax_decay_rule
+
 
 # --------------------------- View context menu wiring ---------------------------
 
@@ -2221,14 +2234,17 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
         if chosen == act_edit:
             # Use constraint_store from parameter (same object as LinkManagerDialog uses)
             constraint_store = constraint_store_param or getattr(model, '_constraint_store', None)
+            time_for_slice = getattr(parent or view, 'time_for_slice', None)
+            Tseed_registry = getattr(parent or view, '_Tseed_registry', None)
             
             dlg = LinkEditorDialog(
                 parent or view,
                 target=pref,
                 slice_count=slice_count,
                 peaks_per_slice=peaks_per_slice,
-                link_store=None,  # Legacy: not used when constraint_store present
                 constraint_store=constraint_store,
+                time_for_slice=time_for_slice,
+                Tseed_registry=Tseed_registry
             )
             if dlg.exec_() == QtWidgets.QDialog.Accepted:
                 # Try new pattern first (ConstraintRule)
@@ -2239,17 +2255,6 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
                     model.dataChanged.emit(idx, idx, [
                         QtCore.Qt.DisplayRole, QtCore.Qt.EditRole, QtCore.Qt.ForegroundRole, QtCore.Qt.ToolTipRole
                     ])
-                    
-                    # Handle T_name seed row for relaxation constraints
-                    mw = parent or view
-                    try:
-                        if hasattr(rule, 'T_name') and rule.T_name:
-                            if isinstance(rule.T_name, str) and rule.T_name.strip():
-                                tname = rule.T_name.strip()
-                                if hasattr(mw, "_ensure_tseed_row"):
-                                    mw._ensure_tseed_row(tname)
-                    except Exception:
-                        pass
 
         elif act_clear and chosen == act_clear:
             # Clear constraint from store
@@ -2348,7 +2353,7 @@ class LinkEngine:
                 registry[tgt]['value'] = float(val)
             
             else:
-                # Check if it's RELAX_EXP type
+                # Check if it's RELAX_DECAY type
                 try:
                     rule = LinkExpr_to_ConstraintRule(expr)
                     is_relax = isinstance(rule, RelaxDecayConstraint)
@@ -2357,7 +2362,7 @@ class LinkEngine:
                 
                 if is_relax:
                     if slice_times is None:
-                        raise ValueError("RELAX_EXP link requires slice_times.")
+                        raise ValueError("RELAX_DECAY link requires slice_times.")
                     A = float(expr.args.get('A', 1.0))
                     C = float(expr.args.get('C', 0.0))
                     T = expr.args.get('T', 1.0)
@@ -2365,12 +2370,12 @@ class LinkEngine:
                     try:
                         T = float(T)
                     except Exception:
-                        raise ValueError("RELAX_EXP (sequential): T must be a numeric value.")
+                        raise ValueError("RELAX_DECAY (sequential): T must be a numeric value.")
                 if not (T > 0 and math.isfinite(T)):
-                    raise ValueError("RELAX_EXP: T must be > 0 and finite.")
+                    raise ValueError("RELAX_DECAY: T must be > 0 and finite.")
                 drv = expr.driver
                 if drv is None:
-                    raise ValueError("RELAX_EXP link missing driver.")
+                    raise ValueError("RELAX_DECAY link missing driver.")
                 drv_entry = registry.get(drv)
                 if not drv_entry or not math.isfinite(drv_entry.get('value', float('nan'))):
                     raise ValueError(f"Driver value missing/invalid for {drv}.")
@@ -2433,7 +2438,7 @@ def _topo_sort_slices_for_links(links: "LinkStore", selected: list[int]) -> list
 def _links_for_target_slice(links: "LinkStore", s: int) -> "LinkStore":
     """
     Return a new LinkStore containing only links whose TARGET lives in slice `s`.
-    (Keep both LINEAR and RELAX_EXP for those targets.)
+    (Keep both LINEAR and RELAX_DECAY for those targets.)
     """
     sub = LinkStore()
     for expr in links.all_expr():
@@ -2759,6 +2764,21 @@ def model_spectrum(
         multiplier=float(multiplier),
         return_fid=return_fid,
     )
+def time_for_slice(t_f1: Optional[Sequence[Any]]) -> Callable[[int], Optional[Any]]:
+    """
+    Factory returning a safe accessor: time_for_slice(sid) -> raw value or None.
+
+    """
+    def time_for_slice(sid: int) -> Optional[Any]:
+        if t_f1 is None:
+            return None
+        if sid < 0 or sid >= len(t_f1):
+            return None
+        try:
+            return t_f1[sid]
+        except Exception:
+            return None
+    return time_for_slice
 
 def Peaks_to_ParamRefList(sid: int, peaks: List):
     ParamRefList = []
@@ -2770,7 +2790,7 @@ def Peaks_to_ParamRefList(sid: int, peaks: List):
     return ParamRefList
 
 def global_ref(sid: int, name: str) -> "ParamRef":
-    # globals still follow the same rule by using peak_id = 000
+    # globals still follow the same rule by using peak_id = 1000
     return ParamRef(slice_id=int(sid), peak_id=1000, name=str(name))
 
 def canon_name(n: str) -> str:
@@ -2975,13 +2995,13 @@ def apply_Tbounds_to_param(par, lo: float | None, hi: float | None) -> None:
 def _get_seed(self, T_name: str):
     rec = None
     # prefer MainWindow-level registry
-    reg1 = getattr(self, "_TSeedRegistry", None)
+    reg1 = getattr(self, "_Tseed_registry", None)
     if isinstance(reg1, dict):
         rec = reg1.get(T_name)
     if rec is None:
         # optional model-level fallback
         mdl = getattr(self, "table_model", None)
-        reg2 = getattr(mdl, "_tseed_registry", None) if mdl is not None else None
+        reg2 = getattr(mdl, "_Tseed_registry", None) if mdl is not None else None
         if isinstance(reg2, dict):
             rec = reg2.get(T_name)
     return rec  # expected keys: {'fixed': Bool, 'T_seed_s': float, 'T_result_s': None}
@@ -3370,14 +3390,7 @@ class CheckableHeader(QtWidgets.QHeaderView):
         if hasattr(self, attr):
             delattr(self, attr)
         self.updateSection(logicalIndex)
-
-@dataclass
-class ParamBounds:
-    lo: float | None = None
-    hi: float | None = None
-    def is_set(self) -> bool:
-        return (self.lo is not None) or (self.hi is not None)
-    
+   
 class BoundsDialog(QtWidgets.QDialog):
     def __init__(self, parent, title="Set Bounds"):
         super().__init__(parent)
@@ -3422,12 +3435,12 @@ class TSeedTableModel(QtCore.QAbstractTableModel):
     COLS = ["T_name", "T_seed (s)", "Fix", "Lo (s)", "Hi (s)", "T_result (s)"]
     def __init__(self, registry: dict[str, dict], parent=None):
         super().__init__(parent)
-        self._reg = registry
-        self._rows = sorted(self._reg.keys())
+        self._Tseed_registry = registry
+        self._rows = sorted(self._Tseed_registry.keys())
 
     def refresh(self):
         self.beginResetModel()
-        self._rows = sorted(self._reg.keys())
+        self._rows = sorted(self._Tseed_registry.keys())
         self.endResetModel()
 
     def rowCount(self, parent=None): return len(self._rows)
@@ -3452,7 +3465,7 @@ class TSeedTableModel(QtCore.QAbstractTableModel):
     def data(self, index, role=QtCore.Qt.DisplayRole):
         if not index.isValid(): return None
         name = self._rows[index.row()]
-        rec = self._reg.get(name, {})
+        rec = self._Tseed_registry.get(name, {})
         c = index.column()
 
         if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
@@ -3480,7 +3493,7 @@ class TSeedTableModel(QtCore.QAbstractTableModel):
     def setData(self, index, value, role=QtCore.Qt.EditRole):
         if not index.isValid(): return False
         name = self._rows[index.row()]
-        rec = self._reg.setdefault(name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
+        rec = self._Tseed_registry.setdefault(name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
         c = index.column()
 
         if c in (1, 3, 4) and role == QtCore.Qt.EditRole:
@@ -3508,10 +3521,10 @@ class TSeedTableDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("T seeds")
         self.resize(520, 360)
-        self._registry = registry
+        self._Tseed_registry = registry
         lay = QtWidgets.QVBoxLayout(self)
         self.tbl = QtWidgets.QTableView(self)
-        self.model = TSeedTableModel(self._registry, self)
+        self.model = TSeedTableModel(self._Tseed_registry, self)
         self.tbl.setModel(self.model)
         # ---- table styling to match PeakTableView ----
         self.tbl.setAlternatingRowColors(True)
@@ -3542,8 +3555,8 @@ class TSeedTableDialog(QtWidgets.QDialog):
         lay.addWidget(btns)
 
     def ensure_row(self, T_name: str):
-        if T_name not in self._registry:
-            self._registry[T_name] = {"fixed": False, "T_seed_s": None, "T_result_s": None}
+        if T_name not in self._Tseed_registry:
+            self._Tseed_registry[T_name] = {"fixed": False, "T_seed_s": None, "T_result_s": None}
             self.model.refresh()
 
     def _on_tseed_menu(self, pos: QtCore.QPoint):
@@ -3551,7 +3564,7 @@ class TSeedTableDialog(QtWidgets.QDialog):
         if not idx.isValid(): return
         r = idx.row()
         name = self.model._rows[r]
-        rec = self.model._reg.get(name, {})
+        rec = self.model._Tseed_registry.get(name, {})
         menu = QtWidgets.QMenu(self.tbl)
         act_bounds = menu.addAction("Set T bounds…")
         act_clear = menu.addAction("Clear T bounds")
@@ -3685,8 +3698,8 @@ class  MainWindow(QMainWindow):
         
         self.link_store = LinkStore()
         # ---- T-seed registry (authoritative) ----
-        # schema: {T_name: {"fixed": bool, "T_seed_s": float|None, "T_result_s": float|None}
-        self._TSeedRegistry: dict[str, dict] = {}
+        # schema: {T_name: {"fixed": bool, "T_seed_s": float|None, "T_result_s": float|None, T_lo_s: float|None, T_hi_s: float|None}}
+        self._Tseed_registry: dict[str, dict] = {}
 
         
         self._buildMainWindow() 
@@ -3838,9 +3851,9 @@ class  MainWindow(QMainWindow):
         ctrls_mid.addWidget(self.btn_excluded)
         self.btn_link_manager = QtWidgets.QPushButton("Link Manager")
         ctrls_mid.addWidget(self.btn_link_manager)
-        self.btn_tseed = QtWidgets.QPushButton("T seeds")
+        self.btn_Tseed = QtWidgets.QPushButton("T seeds")
         self.btn_copy_bounds = QtWidgets.QPushButton("Copy bounds")
-        ctrls_mid.addWidget(self.btn_tseed)
+        ctrls_mid.addWidget(self.btn_Tseed)
         ctrls_mid.addWidget(self.btn_copy_bounds)
 
 
@@ -4202,17 +4215,17 @@ class  MainWindow(QMainWindow):
       
 
     def _on_open_tseed_table(self):
-        dlg = getattr(self, "_tseed_dlg", None)
+        dlg = getattr(self, "_Tseed_dlg", None)
         if dlg is None:
-            dlg = TSeedTableDialog(self, self._TSeedRegistry)
-            self._tseed_dlg = dlg
+            dlg = TSeedTableDialog(self, self._Tseed_registry)
+            self._Tseed_dlg = dlg
         # refresh each time it opens (new T_names might have been added)
         try:
-            for ex in self.link_store.all_expr():
-                if getattr(ex, "type", None) == LinkType.RELAX_EXP and getattr(ex, "enabled", True):
-                    tname = ex.args.get("T_name") or ex.args.get("t_name")
-                    if isinstance(tname, str) and tname.strip():
-                        dlg.ensure_row(tname.strip())
+            for pref, ct in self.constraint_store.all_constraints():
+                if isinstance(ct, RelaxDecayConstraint) and ct.enabled: 
+                    T_name = getattr(ct, "T_name", None)
+                    if isinstance(T_name, str) and T_name.strip():
+                        dlg.ensure_row(T_name.strip())
             dlg.model.refresh()
         except Exception:
             pass
@@ -4221,10 +4234,10 @@ class  MainWindow(QMainWindow):
 
     def _ensure_tseed_row(self, T_name: str):
         if not T_name: return
-        if T_name not in self._TSeedRegistry:
-            self._TSeedRegistry[T_name] = {"fixed": False, "T_seed_s": None, "T_result_s": None, "updated_at": ""}
+        if T_name not in self._Tseed_registry:
+            self._Tseed_registry[T_name] = {"fixed": False, "T_seed_s": 0.001, "T_result_s": None, "T_lo_s": None, "T_hi_s": None}
         # if dialog is open, reflect immediately
-        dlg = getattr(self, "_tseed_dlg", None)
+        dlg = getattr(self, "_Tseed_dlg", None)
         if dlg: 
             try: dlg.ensure_row(T_name)
             except Exception: pass
@@ -4269,7 +4282,7 @@ class  MainWindow(QMainWindow):
         self._span_exc.set_active(False)  # only active when toggle is ON
         
         self.btn_link_manager.clicked.connect(self.on_show_link_manager)
-        self.btn_tseed.clicked.connect(self._on_open_tseed_table)
+        self.btn_Tseed.clicked.connect(self._on_open_tseed_table)
         self.btn_stat.clicked.connect(self.on_show_statistics)
 
 
@@ -4307,10 +4320,10 @@ class  MainWindow(QMainWindow):
         _peaks_per_slice_snapshot = self._peaks_per_slice(getattr(self, "slice_index", 0))
         dlg = LinkManagerDialog(
             self,
-            self.link_store,
             slice_count=_slice_count_snapshot,
             peaks_per_slice=_peaks_per_slice_snapshot,
             constraint_store=getattr(self, "constraint_store", None),
+            time_for_slice=self.time_for_slice,
         )
         dlg.exec_()
         # after user edits links, refresh current table so tooltips / gray text update
@@ -5010,6 +5023,22 @@ class  MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, 'Load error', str(e))
 
+
+
+    def time_for_slice(self, sid: int) -> Optional[Any]:
+        """        
+        Factory returning a safe accessor: time_for_slice(sid) -> raw value or None.
+        """
+        if self.t_f1 is None:
+            return None
+        if sid < 0 or sid >= len(self.t_f1):
+            return None
+        try:
+            return self.t_f1[sid]
+        except Exception:
+            return None
+
+
         # -------------------- 2D mode events --------------------
     def on_toggle_2d_mode(self, checked: bool):
         if self.data2d is None or self.data2d.shape[0] <= 1:
@@ -5397,7 +5426,7 @@ class  MainWindow(QMainWindow):
             try:
                 store = getattr(self, 'constraint_store', None)
                 if store is not None:
-                    orchestrator = FitOrchestrator(constraint_store=store)
+                    orchestrator = FitOrchestrator(constraint_store=store, Tseed_registry=self._Tseed_registry)
             except Exception as e:
                 log.warning('Failed to initialize FitOrchestrator: %s', e) 
 
@@ -5473,9 +5502,9 @@ class  MainWindow(QMainWindow):
 
             # 8) Update peaks & globals from result
             ctx.result_to_peaks(peaks, result.params, sid)
-            self.multiplier = result.params[f'{fmt_pref(global_ref(sid, "mult"))}'].value
-            self.offset     = result.params[f'{fmt_pref(global_ref(sid, "offset"))}'].value
-            self.phi0_deg   = result.params[f'{fmt_pref(global_ref(sid, "phi0_deg"))}'].value
+            self.multiplier = result.params[fmt_pref(global_ref(sid, "mult"))].value
+            self.offset     = result.params[fmt_pref(global_ref(sid, "offset"))].value
+            self.phi0_deg   = result.params[fmt_pref(global_ref(sid, "phi0_deg"))].value
 
             # UI widgets reflect new globals (block signals while setting)
             for w in (self.edt_mult, self.edt_offset):
@@ -5771,10 +5800,10 @@ class  MainWindow(QMainWindow):
                 print(f"{T_name} = {shown} (k={val:.4g} s^-1)  ← {len(members)} targets")
 
             try:
-                rec = self._TSeedRegistry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
+                rec = self._Tseed_registry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
                 rec["T_result_s"] = float(T_val)
                 # optional: if dialog is open, refresh it
-                dlg = getattr(self, "_tseed_dlg", None)
+                dlg = getattr(self, "_Tseed_dlg", None)
                 if dlg: dlg.model.refresh()
             except Exception:
                 pass
@@ -6059,7 +6088,7 @@ class  MainWindow(QMainWindow):
                         pending_linear.append((tgt_ref, drv_ref, a, b))
                         continue
 
-                    # Check if it's RELAX_EXP type
+                    # Check if it's RELAX_DECAY type
                     try:
                         rule = LinkExpr_to_ConstraintRule(expr)
                         is_relax = isinstance(rule, RelaxDecayConstraint)
@@ -6279,16 +6308,15 @@ class  MainWindow(QMainWindow):
 
     def on_seed_saved(self, T_name: str, T_seconds: float, use_flag: bool):
         # LinkEditor may choose to stash a seed; table remains source of truth.
-        if not hasattr(self, "_TSeedRegistry"):
-            self._TSeedRegistry = {}
-        rec = self._TSeedRegistry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
+        if not hasattr(self, "_Tseed_registry"):
+            self._Tseed_registry = {}
+        rec = self._Tseed_registry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
         # store the provided seed; 'use_flag' from old API maps to not-fixed seeding.
         rec["T_seed_s"] = float(T_seconds) if (T_seconds and T_seconds > 0) else None
         # If the user asked to "use for next fits", keep varying (fixed=False); else consider fixing.
         rec["fixed"] = False if bool(use_flag) else rec.get("fixed", False)
-        rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
         # reflect in open dialog
-        dlg = getattr(self, "_tseed_dlg", None)
+        dlg = getattr(self, "_Tseed_dlg", None)
         if dlg: 
             try: dlg.model.refresh()
             except Exception: pass
