@@ -47,7 +47,7 @@ def txt_to_pref(txt: str) -> ParamRef:
         "pos": "pos", "position": "pos", "freq": "pos", "pos_hz": "pos", "pos_ppm": "pos",
         "amp": "amp", "area": "amp", "amplitude": "amp",
         "lor": "lor", "lorentz": "lor", "lor_hz": "lor", "lorentz_hz": "lor",
-        "gauss": "gauss", "gauss_disp": "gauss",
+        "gauss": "gauss", "gauss_disp": "gauss", "gau": "gauss",
     }
     try:
         s_part, p_part, name_part = t.split("_", 2)
@@ -357,6 +357,7 @@ class ConstraintRule(ABC):
         registry: Dict[ParamRef, Dict[str, Any]],
         allow_external: bool = False,
         vary: bool = True,
+        Tseed_registry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> None:
         """
         Apply constraint to lmfit Parameters.
@@ -694,6 +695,7 @@ class LinearConstraint(ConstraintRule):
         registry: Dict[ParamRef, Dict[str, Any]],  # {'value': float}
         allow_external: bool = False,
         vary: bool = True,  # True=joint, False=sequential/single
+        Tseed_registry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> None:
         
         """
@@ -849,27 +851,17 @@ class RelaxDecayConstraint(ConstraintRule):
             raise ValueError(f"Malformed exponential constraint expression: '{UI_rhs_raw}'")
 
         left = raw[:exp_idx-1] # Left of *exp, e.g. 's15_p1_amp*1'
-        right = raw[exp_idx+4:]  # Right of ( to end. remove the '*exp('
-
+        right = raw[exp_idx:]  # from exp to end, e.g. 'exp(-0.1/T_name) + 2'
         # parse left side to get A and driver_txt
         A, driver_txt = RelaxDecayConstraint._split_left_mul(left)
+        out = {"A": A, "driver_txt": driver_txt}
         
         # parse right side to get t, T_name or T, C
-        s = right.replace(")", "")
-        C = 0.0
-        idx_plus = s.find("+", 1)
-        idx_minus = s.find("-", 1)
-        indices = [i for i in (idx_plus, idx_minus) if i != -1]
-        i = min(indices) if indices else -1
-        if i != -1:
-            main = s[:i].replace(" ", "")
-            c_part = s[i:].replace(" ", "")
-            C = float(c_part)
-        else:
-            main = s
-        
-        out = {"A": A, "driver_txt": driver_txt, "C": C}
-        
+        idx = right.find(")")
+        if idx == -1:
+            raise ValueError(f"Malformed exponential constraint expression, missing ')': '{UI_rhs_raw}'")
+        main = right[4:idx]  # inside exp(...)
+
         # main should look like: -0.1/T_name   or  -0.1/0.035
         if not main.startswith("-"):
             raise ValueError(f"Expected '-' at start of exponential argument in '{UI_rhs_raw}'")
@@ -878,19 +870,29 @@ class RelaxDecayConstraint(ConstraintRule):
         if "/" not in main_k:
             raise ValueError(f"Expected form like '-k/T_name' in '{UI_rhs_raw}'")
         t_part, T_part = main_k.split("/", 1)
-        
+
         # add t_override
         t_val = float(t_part[1:])  # skip leading '-'
         out["t_override"] = t_val
-        
+
         # T_part can be numeric or name
         if is_float(T_part):
             # numeric T
             # original exp() used "T"
             out["T_number"] = float(T_part)
+            out["T_name"] = None
         else:
             out["T_name"] = T_part
+            out["T_number"] = None
 
+        rest = right[idx+1:].replace(" ", "")  # after exp(...)
+        if rest:
+            if not rest.startswith("+") and not rest.startswith("-"):
+                raise ValueError(f"Expected '+' or - after exp(...) in '{UI_rhs_raw}'")
+            C_part = rest[1:].strip()
+            out["C"] = float(C_part)
+        else:
+            out["C"] = 0.0
         return out
     
     @classmethod
@@ -982,7 +984,7 @@ class RelaxDecayConstraint(ConstraintRule):
         if self.T_number:
             lmfit_text = display_text
         if self.T_name:
-            lmfit_text = display_text.replace(f"{self.T_name}", f"k__{self.T_name}")
+            lmfit_text = display_text.replace(f"{self.T_name}", f"k__{self.T_name}").replace("/", "*")
         return lmfit_text
     
     @classmethod
@@ -1897,14 +1899,6 @@ class FitOrchestrator:
         # Apply EXTERNAL rules
         for tgt, rule in rules_external:
             try:
-                if vary:
-                    # Joint mode but cross-slice expr not supported in current architecture:
-                    log.warning(
-                        "Cross-slice constraint in joint mode is applied numerically (frozen) for %s. "
-                        "True joint cross-slice constraints require shared/global lmfit Parameters.",
-                        fmt_pref(tgt),
-                    )
-
                 rule.apply_to_lmfit(
                     params=params,
                     registry=registry,

@@ -101,6 +101,7 @@ from constraint_rules import (
     ConstraintType,
     ConstraintRule,
     LinearConstraint,
+    LinkEngine,
     ParseContext,
     RelaxDecayConstraint,
     LinkExpr_to_ConstraintRule,
@@ -187,68 +188,10 @@ class SliceFitState:
     ylim: Optional[Tuple[float,float]] = None
     redchi: Optional[float] = None
     state_stats = None
-
-class LinkType(Enum):
-    LINEAR = auto()       # target = a * driver + b
-    RELAX_DECAY = auto()    # target(i) = driver * A * exp(-t_i / T) + C
-
-
-@dataclass
-class LinkExpr:  # LinkExpr aka math expression of the link
-    target: ParamRef
-    driver: Optional[ParamRef]   
-    args: Dict[str, float]       # LINEAR: {a,b}; RELAX_DECAY: {A,T,t_override,C}
-    enabled: bool = True
-    
-    @property
-    def type(self) -> str:
-        """Infer constraint type from args structure (for backward compatibility)."""
-        if "a" in self.args or "b" in self.args:
-            return "LINEAR"
-        elif "A" in self.args or "T" in self.args or "T_name" in self.args:
-            return "RELAX_DECAY"
-        return "LINEAR"  # default
-
-class LinkStore:
-    """
-    One link per target ParamRef.
-    Also maintains a reverse index for fast 'dependents_of(driver)'.
-    """
-    def __init__(self) -> None:
-        self._by_target: Dict[ParamRef, LinkExpr] = {} #dict {target, LinkExpr aka math expression of the link}
-        self._dependents: Dict[ParamRef, Set[ParamRef]] = {}  # dict{driver, set of targets}
-
-    def set_link(self, expr: LinkExpr) -> None:
-        # Remove old reverse dependency if replacing
-        old = self._by_target.get(expr.target) #expr.target = ParamRef instance. old = LinkExpr instance
-        if old and old.driver:
-            self._dependents.get(old.driver, set()).discard(expr.target)
-
-        self._by_target[expr.target] = expr
-        if expr.driver is not None:
-            self._dependents.setdefault(expr.driver, set()).add(expr.target)
-
-    def remove_link(self, target: ParamRef) -> None:
-        old = self._by_target.pop(target, None)
-        if old and old.driver:
-            self._dependents.get(old.driver, set()).discard(target)
-
-    def get(self, target: ParamRef) -> Optional[LinkExpr]:
-        return self._by_target.get(target)
-
-    def is_linked(self, target: ParamRef) -> bool:
-        s = self._by_target.get(target)
-        return bool(s and s.enabled)
-
-    def all_expr(self) -> Iterable[LinkExpr]:
-        return self._by_target.values()
-
-    def dependents_of(self, driver: ParamRef) -> List[ParamRef]:
-        return list(self._dependents.get(driver, set()))
     
 class LinkManagerDialog(QtWidgets.QDialog):
     """
-    Viewer/editor for all links in a LinkStore.
+    Viewer/editor for all links in a ConstraintStore.
     Editable Expr column with grammar:
 
     LINEAR (implicit target):
@@ -430,7 +373,6 @@ class LinkManagerDialog(QtWidgets.QDialog):
 
             # Iterate through constraints in store
             for target_pref, rule in self._constraint_store.all_constraints():
-                # If you store "None" to mean "no constraint", skip here
                 if rule is None:
                     continue
 
@@ -1147,7 +1089,6 @@ class LinkManagerDialog(QtWidgets.QDialog):
             target=pref,
             slice_count=int(self._slice_count_provider()),
             peaks_per_slice=int(self._peaks_per_slice_provider()),
-            link_store=self._link_store,
             constraint_store=self._constraint_store,
             time_for_slice=self._time_for_slice,
         )
@@ -1192,7 +1133,8 @@ class LinkManagerDialog(QtWidgets.QDialog):
             return
 
         # case 3: this row is the ONLY one for that link → remove from store, then reload
-        self._link_store.remove_link(pref)
+        if self._constraint_store is not None:
+            self._constraint_store.remove_constraint(pref)
         self._reload()
 
     def _clear_row_visual(self, row: int) -> None:
@@ -1222,8 +1164,12 @@ class LinkManagerDialog(QtWidgets.QDialog):
             "This will remove all links. Continue?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         ) == QtWidgets.QMessageBox.Yes:
-            for expr in list(self._link_store.all_expr()):
-                self._link_store.remove_link(expr.target)
+            if self._constraint_store is not None:
+                for target_pref, _ in list(self._constraint_store.all_constraints()):
+                    try:
+                        self._constraint_store.remove_constraint(target_pref)
+                    except Exception:
+                        pass
             self._reload()
 
     def _on_export_links(self):
@@ -1273,7 +1219,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
             })
 
         # gather some meta from parent if available
-        program_version = getattr(parent, "program_version", "mpFit_links_v1")
+        program_version = getattr(parent, "program_version", "nmrFit_links_v0")
         data_file = getattr(parent, "data_file", "")
         try:
             slice_count = int(self._slice_count_provider() or 0)
@@ -1384,7 +1330,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         expected_links = None
         expected_rows = None
         try:
-            expected_links = int(header_meta.get("numberoflinks", ""))
+            expected_links = int(header_meta.get("numberofenabledlinks", ""))
         except Exception:
             expected_links = None
         try:
@@ -1407,118 +1353,103 @@ class LinkManagerDialog(QtWidgets.QDialog):
             except Exception:
                 pass
         
-        self.tbl.blockSignals(True)
-        self.tbl.setRowCount(0)
-        self._row_targets = []
+        # Build ParseContext once for all rows
+        mw = self.parent()
+        reg = getattr(mw, "_Tseed_registry", {})
+        if not isinstance(reg, Mapping):
+            reg = {}
+        
+        ctx = ParseContext(
+            time_for_slice=self._time_for_slice,
+            Tseed_registry=reg,
+            ensure_tseed_row=getattr(mw, "_ensure_tseed_row", None),
+            require_positive_T=True,
+            require_positive_time=False,
+            eps=1e-15,
+        )
 
+        # Process rows and rebuild constraint store
         enabled_seen = 0
+        failed_rows = []
 
-        for row in parsed_rows:
-            r = self.tbl.rowCount()
-            self.tbl.insertRow(r)
-
-            # enabled
-            en_item = QtWidgets.QTableWidgetItem()
-            en_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+        for idx, row in enumerate(parsed_rows):
             is_enabled = row["enabled"] in ("1", "true", "True")
-            en_item.setCheckState(QtCore.Qt.Checked if is_enabled else QtCore.Qt.Unchecked)
             if is_enabled:
                 enabled_seen += 1
-            self.tbl.setItem(r, self.COL_ENABLED, en_item)
 
-            # target
-            tgt_item = QtWidgets.QTableWidgetItem(row["target"])
-            self.tbl.setItem(r, self.COL_TARGET, tgt_item)
+            target_txt = row["target"]
+            if not target_txt:
+                failed_rows.append(f"Row {idx+1}: empty target")
+                continue
 
-            # type
-            typ_item = QtWidgets.QTableWidgetItem(row["type"])
-            typ_item.setFlags(typ_item.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.tbl.setItem(r, self.COL_TYPE, typ_item)
+            try:
+                pref = txt_to_pref(target_txt)
+            except Exception as e:
+                failed_rows.append(f"Row {idx+1}: invalid target '{target_txt}': {e}")
+                continue
 
-            # driver
-            drv_item = QtWidgets.QTableWidgetItem(row["driver"])
-            drv_item.setFlags(drv_item.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.tbl.setItem(r, self.COL_DRIVER, drv_item)
-
-            # expr
-            expr_item = QtWidgets.QTableWidgetItem(row["expr"])
-            self.tbl.setItem(r, self.COL_EXPR, expr_item)
-
-            pref = txt_to_pref(row["target"]) if row["target"] else None
-            self._row_targets.append(pref)
-
-            # Rebuild global ConstraintStore using dispatch_rule_from_ui factory
-            if pref is not None:
-                type_txt = self._norm_type(row["type"])  # "LINEAR" / "RELAX_DECAY"
-                expr_txt = (row["expr"] or "").strip()
-                driver_txt = row["driver"] if row["driver"] else None
-                
-                # Use dispatch_rule_from_ui factory from constraint_rules.py
-                try:
-                    constraint_rule = dispatch_rule_from_ui(
-                        target_pref=pref,
-                        type_txt=type_txt,
-                        driver_txt=driver_txt,
-                        expr_txt=expr_txt,
-                        enabled=is_enabled
-                    )
-                except Exception:
-                    constraint_rule = None
-                
-                if constraint_rule is not None:
-                    # Add to global ConstraintStore
-                    if self._constraint_store is not None:
-                        try:
-                            self._constraint_store.add_constraint(constraint_rule)
-                        except Exception:
-                            pass
-                    
-                    # Legacy: also add to LinkStore for backward compatibility
+            type_txt = self._norm_type(row["type"])
+            expr_txt = (row["expr"] or "").strip()
+            driver_txt = row["driver"] if row["driver"] else None
+            
+            # Skip empty expr (not ready to commit)
+            if not expr_txt:
+                continue
+            
+            # Use dispatch_rule_from_ui factory from constraint_rules.py
+            try:
+                constraint_rule = dispatch_rule_from_ui(
+                    target_pref=pref,
+                    type_txt=type_txt,
+                    driver_txt=driver_txt,
+                    expr_txt=expr_txt,
+                    enabled=is_enabled,
+                    ctx=ctx
+                )
+            except Exception as e:
+                failed_rows.append(f"Row {idx+1} ({target_txt}): {e}")
+                continue
+            
+            if constraint_rule is not None:
+                # Add to global ConstraintStore
+                if self._constraint_store is not None:
                     try:
-                        driver_pref = fmt_pref(driver_txt) if driver_txt else None
-                        link_obj = self._parse_row_to_expr(
-                            target=pref,
-                            type_txt=type_txt,
-                            driver=driver_pref,
-                            expr_txt=expr_txt
-                        )
-                        if link_obj is not None:
-                            link_obj.enabled = is_enabled
-                            self._link_store.set_link(link_obj)
+                        self._constraint_store.add_constraint(constraint_rule)
+                    except Exception as e:
+                        failed_rows.append(f"Row {idx+1} ({target_txt}): store add failed: {e}")
+                        continue
+                                    
+                # If RELAX_DECAY with T_name, ensure registry row exists
+                if isinstance(constraint_rule, RelaxDecayConstraint):
+                    try:
+                        Tn = getattr(constraint_rule, "T_name", None)
+                        if isinstance(Tn, str) and Tn.strip():
+                            parent = self.parent()
+                            if hasattr(parent, "_ensure_tseed_row"):
+                                parent._ensure_tseed_row(str(Tn).strip())
                     except Exception:
                         pass
-                    
-                    # If RELAX_DECAY with T_name, ensure registry row exists
-                    if isinstance(constraint_rule, RelaxDecayConstraint):
-                        try:
-                            Tn = getattr(constraint_rule, "T_name", None)
-                            if isinstance(Tn, str) and Tn.strip():
-                                parent = self.parent()
-                                if hasattr(parent, "_ensure_tseed_row"):
-                                    parent._ensure_tseed_row(str(Tn).strip())
-                        except Exception:
-                            pass
 
+        # Reload table from constraint store
+        self._reload()
 
-        self.tbl.blockSignals(False)
-        try:
-            self._reload()
-        except Exception:
-            pass
-
-        # final small consistency hint
-        msg = "Link table loaded."
+        # Build message
+        msg = f"Link table loaded: {enabled_seen} enabled, {len(parsed_rows)} total rows."
         extra = []
         if expected_rows is not None and expected_rows != len(parsed_rows):
-            extra.append(f"rows in file: {expected_rows}, parsed: {len(parsed_rows)}")
+            extra.append(f"Expected {expected_rows} rows in file, parsed {len(parsed_rows)}")
         if expected_links is not None and expected_links != enabled_seen:
-            extra.append(f"enabled in file: {expected_links}, enabled parsed: {enabled_seen}")
+            extra.append(f"Expected {expected_links} enabled in file, got {enabled_seen}")
+        if failed_rows:
+            extra.append(f"\n{len(failed_rows)} row(s) failed to import:")
+            extra.extend(failed_rows[:10])  # show first 10
+            if len(failed_rows) > 10:
+                extra.append(f"... and {len(failed_rows)-10} more")
+        
         if extra:
-            msg += "\n" + "\n".join(extra)
+            msg += "\n\n" + "\n".join(extra)
 
         QtWidgets.QMessageBox.information(self, "Import Links", msg)
-
-
 
 
 class _GenerateTargetsDialog(QtWidgets.QDialog):
@@ -2281,183 +2212,7 @@ def attach_link_context_menu(view: QtWidgets.QTableView,
 
     view.customContextMenuRequested.connect(_on_menu)
 
-
-
-
-# --------------------------- Link engine ---------------------------
-
-class LinkEngine:
-    @staticmethod
-    def evaluate(registry: Dict[ParamRef, Dict[str, Any]],
-                 slice_times: Optional[List[float]],
-                 links: LinkStore) -> None:
-        """
-        Mutates registry[target]['value'] for all enabled links.
-        registry[ParamRef] = {'value': float, 'fixed': bool, 'bounds': (lo, hi)}
-        """
-        # Build DAG (only LINEAR edges create dependencies).
-        edges: Dict[ParamRef, List[ParamRef]] = {} # Dict[driver, list of targets]
-        indeg: Dict[ParamRef, int] = {} # Dict[driver: 0, target: 1]
-        # driver always has values of  0, means no other parameters control them
-        # targets alsways have values of 1, means 1 driver control them
-
-        targets = [ex.target for ex in links.all_expr() if ex.enabled]
-        # links is LinkStore instance. links.all_expr() = LinkStore._by_target.values()
-        # self._by_target = dict{ParamRef, LinkExpr}, an attribute of LinkStore
-        # s = all values in self._by_target dict = LinkExpr instance
-        # ex.target = LinkExpr.target. target is a ParamRef instance, which is an attribute of LinkExpr
-        # target: list of ex.target (ParamRef instances)
-        for t in targets:
-            indeg[t] = 0
-        for expr in links.all_expr():
-            if not expr.enabled:
-                continue
-            if expr.driver is not None:
-                d = expr.driver
-                edges.setdefault(d, []).append(expr.target)
-                indeg.setdefault(d, 0)
-                indeg[expr.target] = indeg.get(expr.target, 0) + 1
-
-        # Kahn topo-sort over LINEAR and Relaxation exponential dependencies
-        q = [t for t, k in indeg.items() if k == 0] 
-        # q = list of drivers, those are keys that have values of 0 in indeg
-        ordered: List[ParamRef] = []
-        while q:
-            u = q.pop()
-            ordered.append(u)
-            for v in edges.get(u, []):
-                indeg[v] -= 1
-                if indeg[v] == 0:
-                    q.append(v)
-
-        if len(ordered) != len(indeg):
-            raise ValueError("Link cycle detected among links. Resolve before fitting.")
-
-        # Compute order to fit. For each target that has either LINEAR or Exponential expr, compute from its driver
-        exprs_by_target = {ex.target: ex for ex in links.all_expr() if ex.enabled}
-        for tgt in ordered:
-            expr = exprs_by_target.get(tgt)
-            if not expr:
-                continue
-            if expr.type == LinkType.LINEAR:
-                a = float(expr.args.get('a', 1.0))
-                b = float(expr.args.get('b', 0.0))
-                drv = expr.driver
-                if drv is None:
-                    raise ValueError("Link missing driver.")
-                drv_entry = registry.get(drv)
-                if not drv_entry or not math.isfinite(drv_entry.get('value', float('nan'))):
-                    raise ValueError(f"Driver value missing/invalid for {drv}.")
-                val = a * float(drv_entry['value']) + b
-                registry.setdefault(tgt, {'value': val, 'fixed': False, 'bounds': (-math.inf, math.inf)})
-                registry[tgt]['value'] = float(val)
-            
-            else:
-                # Check if it's RELAX_DECAY type
-                try:
-                    rule = LinkExpr_to_ConstraintRule(expr)
-                    is_relax = isinstance(rule, RelaxDecayConstraint)
-                except Exception:
-                    is_relax = False
-                
-                if is_relax:
-                    if slice_times is None:
-                        raise ValueError("RELAX_DECAY link requires slice_times.")
-                    A = float(expr.args.get('A', 1.0))
-                    C = float(expr.args.get('C', 0.0))
-                    T = expr.args.get('T', 1.0)
-                    # sequential path: T must be numeric
-                    try:
-                        T = float(T)
-                    except Exception:
-                        raise ValueError("RELAX_DECAY (sequential): T must be a numeric value.")
-                if not (T > 0 and math.isfinite(T)):
-                    raise ValueError("RELAX_DECAY: T must be > 0 and finite.")
-                drv = expr.driver
-                if drv is None:
-                    raise ValueError("RELAX_DECAY link missing driver.")
-                drv_entry = registry.get(drv)
-                if not drv_entry or not math.isfinite(drv_entry.get('value', float('nan'))):
-                    raise ValueError(f"Driver value missing/invalid for {drv}.")
-                t_i = slice_times[expr.target.slice_id]
-                val = float(drv_entry['value']) * A * math.exp(-t_i / T) + C
-                registry.setdefault(expr.target, {'value': val, 'fixed': False, 'bounds': (-math.inf, math.inf)})
-                registry[expr.target]['value'] = val
-
-# --- Cross-slice helpers for sequential fitting ---
-
-def _topo_sort_slices_for_links(links: "LinkStore", selected: list[int]) -> list[int]:
-    """
-    Topologically sort the selected slice IDs so that cross-slice LINEAR drivers
-    come before their targets. If a cycle spans selected slices, raise ValueError.
-    Slices with no deps keep their original relative order.
-    """
-    selected_set = set(int(s) for s in selected)
-    # Build edges driver_slice -> target_slice for cross-slice LINEAR links
-    indeg = {s: 0 for s in selected_set}
-    edges = {s: [] for s in selected_set}
-
-    for expr in links.all_expr():
-        if not getattr(expr, "enabled", False):
-            continue
-        if getattr(expr, "type", None) != LinkType.LINEAR:
-            continue
-        d = getattr(expr, "driver", None)
-        t = getattr(expr, "target", None)
-        if d is None or t is None:
-            continue
-        ds, ts = int(d.slice_id), int(t.slice_id)
-        if ds in selected_set and ts in selected_set and ds != ts:
-            edges[ds].append(ts)
-            indeg[ts] = indeg.get(ts, 0) + 1
-
-    # Kahn's algorithm with stable layering (preserve user order within layers)
-    order = []
-    layer = [s for s in selected if indeg.get(s, 0) == 0]  # seed in user order
-    seen = set(layer)
-    while layer:
-        nxt = []
-        for u in layer:
-            order.append(u)
-            for v in edges.get(u, []):
-                indeg[v] -= 1
-                if indeg[v] == 0 and v not in seen:
-                    nxt.append(v)
-                    seen.add(v)
-        layer = nxt
-
-    if len(order) != len(selected_set):
-        # Cycle among the selected slices – force joint fit or break links
-        raise ValueError("Cross-slice link cycle detected among selected slices.")
-    # Add any selected slices that had no nodes at all (paranoia)
-    for s in selected:
-        if s not in order:
-            order.append(s)
-    return order
-
-def _links_for_target_slice(links: "LinkStore", s: int) -> "LinkStore":
-    """
-    Return a new LinkStore containing only links whose TARGET lives in slice `s`.
-    (Keep both LINEAR and RELAX_DECAY for those targets.)
-    """
-    sub = LinkStore()
-    for expr in links.all_expr():
-        if not getattr(expr, "enabled", False):
-            continue
-        tgt = getattr(expr, "target", None)
-        if tgt is None or int(tgt.slice_id) != int(s):
-            continue
-        # Recreate an equivalent expr in the subset
-        sub.set_link(LinkExpr(
-            type=expr.type,
-            target=expr.target,
-            driver=expr.driver,
-            args=dict(expr.args),
-            enabled=True,
-        ))
-    return sub
-
-   
+  
 
 # -------------------------- Unit conversion. A fit uses Hz unit for pos, lor, gauss, and bound internally. ----------------------------
 def ppm_to_hz(x_ppm, ref: float):
@@ -2817,7 +2572,7 @@ class FitContext:
         self.orchestrator: Optional[FitOrchestrator] = None
         self.constraint_errors: List[ConstraintValidationError] = []
 
-    def build_params(self, peaks: List[Peak], sid: int, multiplier: float = 1.0, offset: float = 0.0, *, prefix: str = "") -> Parameters: 
+    def build_params(self, peaks: List[Peak], sid: int, multiplier: float = 1.0, offset: float = 0.0) -> Parameters: 
         #Parameters always contains pos lor and gauss in Hz
         p = Parameters()
 
@@ -2856,6 +2611,69 @@ class FitContext:
             peaks[i].lor_hz     = params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="lor"))}'].value
             peaks[i].gauss_disp = hz_to_ppm(params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value, self.ref) if self.axis_mode.lower() == 'ppm' else params[f'{fmt_pref(ParamRef(slice_id=sid, peak_id=i, name="gauss"))}'].value
 
+    def build_joint_params(
+        self,
+        indices: List[int],
+        slice_states: Dict[int, Any],
+        data2d: np.ndarray,
+        multiplier: float,
+        offset: float,
+
+    ) -> Tuple[Parameters, List[Tuple[int, 'FitContext', List[Peak], List[Tuple[bool,bool,bool,bool]], str]], Dict[str, Any]]:
+        """
+        Build joint lmfit.Parameters and per-slice contexts for selected slices.
+                
+        Returns:
+            (params_all, slice_ctxs, report)
+            where slice_ctxs = [(sid, ctx, peaks, fix_flags, prefix), ...]
+                  report = {"errors": [...], "info": {...}}
+        """
+        params_all = Parameters()
+        slice_ctxs: List[Tuple[int, FitContext, List[Peak], List[Tuple[bool,bool,bool,bool]], str]] = []
+        report = {"errors": [], "info": {}}
+
+        if self.x is None:
+            report["errors"].append("Display axis is not available.")
+            return params_all, slice_ctxs, report
+
+        joint_slices = sorted(set(int(s) for s in indices))
+
+        # Build per-slice parameters
+        for sid in joint_slices:
+            st = slice_states.get(sid)
+            if st is None:
+                # Skip slices without state
+                continue
+
+            peaks = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in (st.peaks or [])]
+            if not peaks:
+                continue
+
+            if st.fix_flags and len(st.fix_flags) >= len(peaks):
+                fix_flags = [tuple(ff) for ff in st.fix_flags[:len(peaks)]]
+            else:
+                fix_flags = [(False, False, False, False)] * len(peaks)
+
+            y_slice = data2d[sid, :].astype(float)
+            ctx = FitContext(self.x, y_slice, self.axis_mode, self.ref, self.sw_hz)
+
+            # Build params for this slice
+            p_s = ctx.build_params(
+                peaks=peaks,
+                sid=sid,
+                multiplier=multiplier,
+                offset=offset,
+            )
+            for name, par in p_s.items():
+                params_all.add(par)
+
+            slice_ctxs.append((sid, ctx, peaks, fix_flags, ""))
+
+        if not slice_ctxs:
+            report["errors"].append("No slices with peaks to fit.")
+            return params_all, slice_ctxs, report
+
+        return params_all, slice_ctxs, report
 
 
     def residual(self, params: Parameters, no_of_peaks, sid) -> np.ndarray:
@@ -2966,45 +2784,6 @@ def apply_bounds_to_param(par: Parameter, model, slice_id: int, peak_idx: int,
         # keep optimizer robust if UI/model is unavailable
         pass
 
-def _T_bounds_to_k_bounds(T_lo, T_hi):
-    """Map T-bounds (seconds) → k-bounds (s^-1). Allows None on either side."""
-    def inv(x): 
-        try:
-            return None if (x is None or float(x) <= 0.0) else 1.0/float(x)
-        except Exception:
-            return None
-    # flip: k ∈ [1/T_hi, 1/T_lo]
-    k_lo = inv(T_hi)
-    k_hi = inv(T_lo)
-    # keep order sane if both present and inverted
-    if k_lo is not None and k_hi is not None and k_lo > k_hi:
-        k_lo, k_hi = k_hi, k_lo
-    return k_lo, k_hi
-
-def apply_Tbounds_to_param(par, lo: float | None, hi: float | None) -> None:
-
-    """
-    Apply numeric bounds directly to an lmfit Parameter (no unit conversion). 
-    To be moved to FitOrchestrator later.
-    """
-    if lo is not None:
-        par.min = float(lo)
-    if hi is not None:
-        par.max = float(hi)
-
-def _get_seed(self, T_name: str):
-    rec = None
-    # prefer MainWindow-level registry
-    reg1 = getattr(self, "_Tseed_registry", None)
-    if isinstance(reg1, dict):
-        rec = reg1.get(T_name)
-    if rec is None:
-        # optional model-level fallback
-        mdl = getattr(self, "table_model", None)
-        reg2 = getattr(mdl, "_Tseed_registry", None) if mdl is not None else None
-        if isinstance(reg2, dict):
-            rec = reg2.get(T_name)
-    return rec  # expected keys: {'fixed': Bool, 'T_seed_s': float, 'T_result_s': None}
 # --------------------------- Peak table model ---------------------------
 
 COLUMN_NAMES = ["Pos", "Amp", "Lorentz", "Gauss"]
@@ -3540,10 +3319,10 @@ class TSeedTableDialog(QtWidgets.QDialog):
         self.tbl.horizontalHeader().setSectionsClickable(False)
         self.tbl.setShowGrid(False)
 
-        # scientific editor for "T_seed (s)" (col 1)
-        self.tbl.setItemDelegateForColumn(
-            1, ScientificDoubleDelegate(self.tbl, decimals=6)
-        )
+        # scientific editor for numeric columns with 6 decimals
+        sci_delegate = ScientificDoubleDelegate(self.tbl, decimals=6)
+        for col in (1, 3, 4, 5):  # T_seed, Lo, Hi, T_result
+            self.tbl.setItemDelegateForColumn(col, sci_delegate)
 
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         lay.addWidget(self.tbl, 1)
@@ -3696,7 +3475,6 @@ class  MainWindow(QMainWindow):
         self.slice_states[0] = SliceFitState()
         self.constraint_store = ConstraintStore()
         
-        self.link_store = LinkStore()
         # ---- T-seed registry (authoritative) ----
         # schema: {T_name: {"fixed": bool, "T_seed_s": float|None, "T_result_s": float|None, T_lo_s: float|None, T_hi_s: float|None}}
         self._Tseed_registry: dict[str, dict] = {}
@@ -3708,8 +3486,7 @@ class  MainWindow(QMainWindow):
         self.update_ui_state()
         self._ui_busy = 0
         
-        # A5: dataset-scope link store
-        
+        # A5: dataset-scope link store       
 
     def _buildMainWindow(self):
         self.setWindowTitle('NMR Peak Deconvolution (FID→FFT) – lmfit')
@@ -3964,7 +3741,6 @@ class  MainWindow(QMainWindow):
             slice_count=_slice_count_snapshot,
             peaks_per_slice=_peaks_per_slice_snapshot,
             get_target_from_index=self.peak_model.index_to_paramref,
-            link_store=self.link_store,
             constraint_store=getattr(self, 'constraint_store', None),  # Pass same store as LinkManagerDialog
             enable_linear=True,
             enable_decay=True,   # placeholder
@@ -4081,21 +3857,21 @@ class  MainWindow(QMainWindow):
     def on_refresh_constraint_status(self) -> None:
         """
         Phase 6B: Update constraint diagnostic panel with current status.
-        - Count constraints from link_store
+        - Count constraints from constraint_store
         - Show linked peaks
         - Update status indicator color
         """
         try:
-            if not hasattr(self, 'link_store') or not self.link_store:
+            if not hasattr(self, 'constraint_store') or not self.constraint_store:
                 self.constraint_status_label.setText("No constraints defined")
                 self.constraint_status_indicator.setStyleSheet("color: green; font-size: 14px;")
                 self.constraint_list_text.setPlainText("")
                 return
 
             # Count constraints
-            all_exprs = list(self.link_store.all_expr())
-            enabled_count = sum(1 for e in all_exprs if getattr(e, 'enabled', True))
-            total_count = len(all_exprs)
+            all_constraints = list(self.constraint_store.all_constraints())
+            enabled_count = sum(1 for _, rule in all_constraints if getattr(rule, 'enabled', True))
+            total_count = len(all_constraints)
 
             # Build constraint summary
             constraint_lines = []
@@ -4110,17 +3886,17 @@ class  MainWindow(QMainWindow):
             # List constraints for current slice
             slice_targets = []
             slice_drivers = []
-            for expr in all_exprs:
-                if expr.target and int(expr.target.slice_id) == sid:
-                    slice_targets.append(expr.target)
-                if expr.driver and int(expr.driver.slice_id) == sid:
-                    slice_drivers.append(expr.driver)
+            for target_pref, rule in all_constraints:
+                if target_pref and int(target_pref.slice_id) == sid:
+                    slice_targets.append((target_pref, rule))
+                driver_pref = getattr(rule, 'driver_pref', None)
+                if driver_pref and int(driver_pref.slice_id) == sid:
+                    slice_drivers.append(driver_pref)
 
             if slice_targets:
                 constraint_lines.append(f"Targets in s{sid}:")
-                for tgt in slice_targets:
-                    expr = self.link_store.get(tgt)
-                    status_icon = "✓" if getattr(expr, 'enabled', True) else "✗"
+                for tgt, rule in slice_targets:
+                    status_icon = "✓" if getattr(rule, 'enabled', True) else "✗"
                     constraint_lines.append(
                         f"  {status_icon} s{tgt.slice_id}_p{tgt.peak_id}_{tgt.name}"
                     )
@@ -4153,7 +3929,7 @@ class  MainWindow(QMainWindow):
         Shows results in a dialog.
         """
         try:
-            if not hasattr(self, 'link_store') or not self.link_store:
+            if not hasattr(self, 'constraint_store') or not self.constraint_store:
                 QtWidgets.QMessageBox.information(self, "Test Constraint", "No constraints defined.")
                 return
 
@@ -4166,9 +3942,9 @@ class  MainWindow(QMainWindow):
             sid = int(getattr(self, "slice_index", 0))
             peak_map = {(sid, i): peaks[i] for i in range(len(peaks))}
 
-            # Create orchestrator from link_store
+            # Create orchestrator from constraint_store
             try:
-                orchestrator = FitOrchestrator.from_link_store(self.link_store)
+                orchestrator = FitOrchestrator(self.constraint_store)
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Test Constraint", f"Failed to create orchestrator:\n{e}")
                 return
@@ -4185,7 +3961,7 @@ class  MainWindow(QMainWindow):
                 self.constraint_status_indicator.setStyleSheet("color: red; font-size: 14px;")
                 QtWidgets.QMessageBox.warning(self, "Constraint Validation", error_msg)
             else:
-                success_msg = f"✓ All {len(list(self.link_store.all_expr()))} constraint(s) are valid!"
+                success_msg = f"✓ All {len(list(self.constraint_store.all_constraints()))} constraint(s) are valid!"
                 self.constraint_status_indicator.setStyleSheet("color: green; font-size: 14px;")
                 QtWidgets.QMessageBox.information(self, "Constraint Validation", success_msg)
 
@@ -4206,11 +3982,15 @@ class  MainWindow(QMainWindow):
         # fallback: current model length
         return len(getattr(self.peak_model, "_peaks", []))
 
-    def get_links(self) -> "LinkStore":
-        return self.link_store
+    def get_links(self) -> "ConstraintStore":
+        return self.constraint_store
 
     def clear_links(self) -> None:
-        self.link_store.clear()
+        for target_pref, _ in list(self.constraint_store.all_constraints()):
+            try:
+                self.constraint_store.remove_constraint(target_pref)
+            except Exception:
+                pass
         self.peak_model.layoutChanged.emit()
       
 
@@ -4662,20 +4442,6 @@ class  MainWindow(QMainWindow):
         peaks, fix_flags, _ = self.peak_model.return_model()
         self.peaks = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks]
         self._fix_flags_cache = [tuple(ff) for ff in fix_flags]  # for fast access
-
-
-    def fix_flags(self, i: int) -> tuple[bool,bool,bool,bool]:
-        """Compat helper used by on_fit(); returns (pos, amp, lor, gauss) fixed flags."""
-        try:
-            return self._fix_flags_cache[i]
-        except Exception:
-            _, fix_flags, _ = self.peak_model.return_model()
-            if 0 <= i < len(fix_flags):
-                return tuple(fix_flags[i])
-            # fallback default
-            d = getattr(self, "_default_fix", dict(pos=False, amp=False, lor=True, gauss=False))
-            return (d["pos"], d["amp"], d["lor"], d["gauss"])
-        
 
 
     def _grid_hz(self) -> float:
@@ -5358,6 +5124,75 @@ class  MainWindow(QMainWindow):
         self.refresh_plot(preserve_view=True)
         self.update_ui_state()
 
+    def fix_flags(self, i: int) -> tuple[bool,bool,bool,bool]:
+        """Compat helper used by on_fit(); returns (pos, amp, lor, gauss) fixed flags."""
+        try:
+            return self._fix_flags_cache[i]
+        except Exception:
+            _, fix_flags, _ = self.peak_model.return_model()
+            if 0 <= i < len(fix_flags):
+                return tuple(fix_flags[i])
+            # fallback default
+            d = getattr(self, "_default_fix", dict(pos=False, amp=False, lor=True, gauss=False))
+            return (d["pos"], d["amp"], d["lor"], d["gauss"])
+        
+    def _apply_bounds_and_fix_flags(
+        self,
+        params: Parameters,
+        sid: int,
+        peaks: List[Peak],
+        fix_flags: List[Tuple[bool, bool, bool, bool]],
+    ) -> None:
+        """
+        Apply bounds from self.peak_model and fix flags from UI to lmfit Parameters.
+
+        """
+        # Apply bounds from peak_model
+        for pid in range(len(peaks)):
+            for pname in ["pos", "amp", "lor", "gauss"]:
+                pref = ParamRef(sid, pid, pname)
+                param_key = fmt_pref(pref)
+                if param_key in params:
+                    apply_bounds_to_param(params[param_key], self.peak_model, sid, pid, pname, self.axis_mode, self.ref)
+
+        # Fallback bounds for parameters without user-set bounds
+        for pid in range(len(peaks)):
+            for nm, default_max in (("lor", 10000.0), ("gauss", 10000.0)):
+                pref = ParamRef(slice_id=sid, peak_id=pid, name=nm)
+                param_key = fmt_pref(pref)
+                b = self.peak_model.get_bounds_for(pref) if self.peak_model else None
+                if not (b and b.is_set()) and param_key in params:
+                    params[param_key].min = 0.0
+                    params[param_key].max = float(default_max)
+
+            prefA = ParamRef(slice_id=sid, peak_id=pid, name="amp")
+            param_key_amp = fmt_pref(prefA)
+            bA = self.peak_model.get_bounds_for(prefA) if self.peak_model else None
+            if not (bA and bA.is_set()) and param_key_amp in params:
+                params[param_key_amp].min = 0.0
+
+        # Global fixed flags (from UI)
+        mult_key = fmt_pref(global_ref(sid, "mult"))
+        phi0_key = fmt_pref(global_ref(sid, "phi0_deg"))
+        offset_key = fmt_pref(global_ref(sid, "offset"))
+        
+        if mult_key in params:
+            params[mult_key].set(vary=not self.fix_mult, value=self.multiplier)
+        if phi0_key in params:
+            params[phi0_key].set(vary=not self.fix_phi0, value=self.phi0_deg)
+        if offset_key in params:
+            params[offset_key].set(vary=not self.fix_offset, value=self.offset)
+
+        # Per-peak fixed flags
+        for pid in range(len(peaks)):
+            if pid < len(fix_flags):
+                fpos, famp, flor, fgauss = fix_flags[pid]
+                for name, flag in zip(["pos", "amp", "lor", "gauss"], [fpos, famp, flor, fgauss]):
+                    pref = ParamRef(sid, pid, name)
+                    param_key = fmt_pref(pref)
+                    if param_key in params:
+                        params[param_key].vary = not flag
+
     def on_fit_current(self, *, allow_external_drivers: bool = False, vary: bool = True, status: bool = True):
         # 0) Guards (before busy)
         if self.x is None or self.y is None or self.peak_model.rowCount() == 0:
@@ -5385,41 +5220,13 @@ class  MainWindow(QMainWindow):
             params = ctx.build_params(peaks, sid, self.multiplier, self.offset) #params is a Paramters instance aka a dictionary
             reg = FitOrchestrator.build_registry_for_slice(slice_id=sid, slice_states=self.slice_states, peaks_override=peaks)
                
-            # globals vary/freeze
-                        
-            params[fmt_pref(global_ref(sid, "mult"))].set(vary=not self.fix_mult,    value=self.multiplier)
-            params[fmt_pref(global_ref(sid, "phi0_deg"))].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params[fmt_pref(global_ref(sid, "offset"))].set(vary=not self.fix_offset, value=self.offset)     
-             
-            # Build per-peak vary for lmfit from GUI fix flags. lmfit set vary = 1. GUI set fix = 1 to be consistent with ssnake
-
-            for pid in range(len(peaks)):
-                fpos, famp, flor, fgauss = fix_flags[pid]
-                for name, flag in zip(["pos", "amp", "lor", "gauss"], [fpos, famp, flor, fgauss]):
-                    pref = ParamRef(sid, pid, name)
-                    if fmt_pref(pref) in params:
-                        params[fmt_pref(pref)].vary   = not flag
-           
-            # Apply bounds from peak model if any. Move to FitOrchestrator later
-       
-            for pid in range(len(peaks)):
-                for pname in ["pos", "amp", "lor", "gauss"]:
-                    pref = ParamRef(sid, pid, pname)
-                    param_key = fmt_pref(pref)
-                    if param_key in params:
-                        apply_bounds_to_param(params[param_key], self.peak_model, sid, pref.peak_id, pref.name, self.axis_mode, self.ref)
-
-                    # Apply fallback bounds for parameters without user-set bounds                    
-                    if pref.name in ("lor", "gauss"):
-                        b = self.peak_model.get_bounds_for(pref) if self.peak_model else None
-                        if not (b and b.is_set()) and param_key in params:
-                            params[param_key].min = 0.0
-                            params[param_key].max = 10000
-                    elif pref.name == "amp":
-                        b_amp = self.peak_model.get_bounds_for(pref) if self.peak_model else None
-                        if not (b_amp and b_amp.is_set()) and param_key in params:
-                            params[param_key].min = 0.0
-            
+            # Apply bounds and fix flags
+            self._apply_bounds_and_fix_flags(
+                params=params,
+                sid=sid,
+                peaks=peaks,
+                fix_flags=fix_flags,
+            )
 
             # 3b) Create orchestrator if constraint store exists
             orchestrator: Optional[FitOrchestrator] = None
@@ -5474,31 +5281,7 @@ class  MainWindow(QMainWindow):
                 return  # finally{} will end_busy()
 
             # 7) Debug log (optional, to be removed later)
-            if DEBUG_LOGGING:
-                try:
-                    x_disp = self.x.astype(float)
-                    is_ppm = (self.axis_mode == 'ppm')
-                    MHz    = float(self.ref)
-                    x_hz   = ppm_to_hz(x_disp, MHz) if is_ppm else x_disp
-                    sw_grid_hz = calc_sw_hz(x_hz) if x_hz.size > 1 else float("nan")
-                    p = result.params
-                    phi0_deg_final = p['phi0_deg'].value if 'phi0_deg' in p else 0.0
-                    v_phi0_fin     = p['phi0_deg'].vary  if 'phi0_deg' in p else None
-                    log.info(
-                        "FINAL | MHz=%.6f | sw_display=%.3f Hz | sw_hz(ctx)=%s | mult=%.3f | "
-                        "phi0=%.6g deg (vary=%s) | success=%s | nfev=%d | |res|=%.6g | %s | %s",
-                        MHz, sw_grid_hz,
-                        "None" if (self.sw_hz is None) else f"{float(self.sw_hz):.1f}",
-                        float(p['mult'].value),
-                        float(phi0_deg_final), v_phi0_fin,
-                        result.success,
-                        result.nfev,
-                        np.linalg.norm(result.residual),
-                        _arr_summary("x_disp", x_disp),
-                        _arr_summary("x_hz",   x_hz),
-                    )
-                except Exception as _e:
-                    log.warning("FINAL logging failed: %s", _e)
+
 
             # 8) Update peaks & globals from result
             ctx.result_to_peaks(peaks, result.params, sid)
@@ -5609,7 +5392,7 @@ class  MainWindow(QMainWindow):
 
         # 1) Order slices so cross-slice LINEAR drivers come first
         try:
-            order = _topo_sort_slices_for_links(self.link_store, list(selected))
+            order = LinkEngine.topo_sort_paramrefs(self.constraint_store, list(selected))
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Sequential fit blocked", str(e))
             return
@@ -5663,21 +5446,91 @@ class  MainWindow(QMainWindow):
             return
         x_disp = x_disp.astype(float)
 
-        load = self._build_joint_params(indices)
-        if not load or load[0] is None:
-            QtWidgets.QMessageBox.warning(self, "Joint Fit", "Failed to build joint parameters.")
-            return
-
-        params_all, slice_ctxs, report = load
+        # Build joint parameters using instance method
+        ctx_builder = FitContext(x_disp, np.zeros_like(x_disp), axis_mode, ref_MHz, sw_hz)
+        
+        params_all, slice_ctxs, report = ctx_builder.build_joint_params(
+            indices=indices,
+            slice_states=self.slice_states,
+            data2d=data2d,
+            multiplier=self.multiplier,
+            offset=self.offset,
+        )
+        
         if report.get("errors"):
             QtWidgets.QMessageBox.warning(self, "Joint Fit", "\n".join(report["errors"]))
             return
         
+        # Apply mask to each slice context
+        mask_w = self._mask_from_excluded(x_disp)
+        for sid, ctx, peaks, fix_flags, _ in slice_ctxs:
+            ctx.mask_w = mask_w
+        
+        # Apply bounds and fix flags for all slices
+        for sid, _, peaks, fix_flags, _ in slice_ctxs:
+            self._apply_bounds_and_fix_flags(
+                params=params_all,
+                sid=sid,
+                peaks=peaks,
+                fix_flags=fix_flags,
+            )
+        
+        # Apply constraints using FitOrchestrator (similar to on_fit_current)
+        orchestrator: Optional[FitOrchestrator] = None
+        try:
+            constraint_store = getattr(self, 'constraint_store', None)
+            if constraint_store is not None:
+                orchestrator = FitOrchestrator(
+                    constraint_store=constraint_store,
+                    Tseed_registry=self._Tseed_registry
+                )
+        except Exception as e:
+            log.warning('Failed to initialize FitOrchestrator: %s', e)
+        
+        # Validate constraints BEFORE applying
+        if orchestrator:
+            peak_map = {}
+            for sid, _, peaks, _, _ in slice_ctxs:
+                for pid, pk in enumerate(peaks):
+                    peak_map[(sid, pid)] = pk
+            
+            validation_errors = orchestrator.validate_constraints(peak_map, self.slice_states)
+            if validation_errors:
+                error_msg = "Constraint validation errors:\n\n"
+                for error in validation_errors:
+                    error_msg += f"• {fmt_pref(error.target_pref)}: {error.message}\n"
+                QtWidgets.QMessageBox.warning(self, "Constraint Validation Failed", error_msg)
+                return
+        
+        # Apply constraints via orchestrator
+        if orchestrator:
+            try:
+                joint_slices = sorted(set(int(s) for s in indices))
+                registry = FitOrchestrator.build_registry_for_slices(
+                    slice_ids=joint_slices,
+                    slice_states=self.slice_states,
+                )
+                
+                for sid in joint_slices:
+                    orchestrator.apply_constraints_to_lmfit(
+                        params=params_all,
+                        registry=registry,
+                        slice_states=self.slice_states,
+                        slice_id=sid,
+                        allow_external=True,
+                        vary=True,  # Joint mode
+                        strict_external_seed=True,
+                        Tseed_registry=self._Tseed_registry,
+                    )
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Constraint Application Error", str(e))
+                return
+        
         # Joint residual = concat of per-slice robust residuals
         def _joint_residual(params: Parameters) -> np.ndarray:
             chunks = []
-            for sid, ctx, tmpl, _fix, _pre in slice_ctxs:
-                r = ctx.residual(params, tmpl)
+            for sid, ctx, peaks, _fix, _pre in slice_ctxs:
+                r = ctx.residual(params, len(peaks), sid)
                 chunks.append(np.asarray(r, dtype=float).ravel())
             return np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
 
@@ -5697,15 +5550,15 @@ class  MainWindow(QMainWindow):
             return
 
         # Scatter back per slice; refresh caches/UI
-        for sid, ctx, tmpl, fix_flags, pre in slice_ctxs:
-            ctx.result_to_peaks(tmpl, result.params, prefix=pre)
+        for sid, ctx, peaks, fix_flags, pre in slice_ctxs:
+            ctx.result_to_peaks(peaks, result.params, sid)
             mult_val  = result.params[f'{fmt_pref(global_ref(sid, "mult"))}'].value
             off_val   = result.params[f'{fmt_pref(global_ref(sid, "offset"))}'].value
             phi0_val  = result.params[f'{fmt_pref(global_ref(sid, "phi0_deg"))}'].value
 
             st = self.slice_states.get(sid) or SliceFitState()
             self.slice_states[sid] = st
-            st.peaks      = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in tmpl]
+            st.peaks      = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks]
             st.fix_flags  = [tuple(ff) for ff in fix_flags]
             st.axis_mode  = str(axis_mode)
             st.multiplier = float(mult_val)
@@ -5788,25 +5641,28 @@ class  MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        for T_name, members in report.get("T_results", {}).items():
-            k_name = f"k__{T_name}"
-            val = result.params[k_name].value if k_name in result.params else None
-            if val is None:
-                print(f"{T_name}: (not in result)  ← {len(members)} targets")
-            else:
-                # pretty print: s or ms
-                T_val = float(1 / val)
-                shown = f"{T_val:.4g} s" if T_val >= 1 else f"{T_val*1e3:.4g} ms"
-                print(f"{T_name} = {shown} (k={val:.4g} s^-1)  ← {len(members)} targets")
-
-            try:
-                rec = self._Tseed_registry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
-                rec["T_result_s"] = float(T_val)
-                # optional: if dialog is open, refresh it
-                dlg = getattr(self, "_Tseed_dlg", None)
-                if dlg: dlg.model.refresh()
-            except Exception:
-                pass
+        # Extract T results directly from result.params (k__ parameters)
+        for param_name, param_obj in result.params.items():
+            if param_name.startswith("k__"):
+                T_name = param_name[3:]  # remove "k__" prefix
+                val = param_obj.value
+                if val is not None and val > 0:
+                    try:
+                        # Calculate T from k (k = 1/T)
+                        T_val = float(1 / val)
+                        shown = f"{T_val:.4g} s" if T_val >= 1 else f"{T_val*1e3:.4g} ms"
+                        print(f"{T_name} = {shown} (k={val:.4g} s^-1)")
+                        
+                        # Update registry
+                        rec = self._Tseed_registry.setdefault(T_name, {"fixed": False, "T_seed_s": None, "T_result_s": None})
+                        rec["T_result_s"] = float(T_val)
+                        
+                        # Refresh dialog if open
+                        dlg = getattr(self, "_Tseed_dlg", None)
+                        if dlg: 
+                            dlg.model.refresh()
+                    except Exception as e:
+                        print(f"Failed to process {T_name}: {e}")
 
         try:
             nfev = int(result.nfev)
@@ -5817,481 +5673,6 @@ class  MainWindow(QMainWindow):
         finally:
             try: self._end_busy()
             except Exception: pass
-
-    def _seed_external_drivers_into_registry(
-        self,
-        *,
-        registry: Dict[ParamRef, Dict[str, Any]],
-        slice_states: Dict[int, Any],
-        target_slice_id: int,
-        enabled_only: bool = True,
-        strict: bool = True,
-    ) -> Set[ParamRef]:
-        """
-        For enabled constraints targeting target_slice_id whose driver lives in another slice,
-        inject the driver's numeric value into registry.
-
-        Returns:
-          Set of external (cross-slice) driver ParamRefs required by constraints targeting this slice.
-        """
-        sid = int(target_slice_id)
-        missing: List[Tuple[ParamRef, str]] = []
-        external: Set[ParamRef] = set()
-
-        # 1) Collect external drivers needed for rules targeting this slice
-        for tgt, rule in self.constraint_store.all_constraints():
-            if enabled_only and not getattr(rule, "enabled", True):
-                continue
-            if int(tgt.slice_id) != sid:
-                continue
-
-            drv = getattr(rule, "driver_pref", None)
-            if drv is None:
-                continue
-
-            if int(drv.slice_id) != int(tgt.slice_id):
-                external.add(drv)
-
-        if not external:
-            return set()
-
-        # 2) Canonical mapping name -> Peak attribute
-        # No normalization/synonyms: upstream must ensure ParamRef.name is canonical.
-        name_to_attr = {"pos": "pos", "amp": "amp", "lor": "lor_hz", "gauss": "gauss_disp",}
-
-        # 3) Seed values
-        for drv in external:
-            # Preserve any caller-provided value
-            if drv in registry and "value" in (registry.get(drv) or {}):
-                continue
-
-            ds = int(drv.slice_id)
-            st = (slice_states or {}).get(ds)
-            if st is None:
-                missing.append((drv, f"slice_states[{ds}] not found"))
-                continue
-
-            peaks = getattr(st, "peaks", None)
-            if not peaks:
-                missing.append((drv, f"slice_states[{ds}].peaks missing/empty"))
-                continue
-
-            try:
-                pk = peaks[int(drv.peak_id)]
-            except Exception:
-                missing.append((drv, f"peak_id {drv.peak_id} not present in slice {ds} (len={len(peaks)})"))
-                continue
-
-            pname = getattr(drv, "name", None)
-            attr = name_to_attr.get(pname)
-            if attr is None:
-                missing.append((drv, f"non-canonical ParamRef.name '{pname}' (expected one of {sorted(name_to_attr)})"))
-                continue
-
-            try:
-                val = float(getattr(pk, attr))
-            except Exception as ex:
-                missing.append((drv, f"value read failed for attr '{attr}': {ex}"))
-                continue
-
-            registry[drv] = {"value": val}
-
-        if strict and missing:
-            lines = [f"- driver {fmt_pref(drv)}: {why}" for drv, why in missing]
-            raise RuntimeError("Cross-slice driver seeding failed:\n" + "\n".join(lines))
-
-        return external
-
-    def _build_joint_params(self, indices):
-        """
-        Build joint lmfit.Parameters and per-slice contexts for the selected slices.
-        Supports:
-          - linear links
-          - exponential links with GUI schema:
-            driver
-            args = {
-                "A" float               # optional, default 1.0
-                "T_name": "t_1",          # shared fitted parameter
-                "T_value": float,         # alternative: fixed T
-                "t_override": float,      # seconds, optional
-                "C": float,               # optional, default 0.0
-            }
-        1) obtain global parameters + relaxation time if any
-        2) loop through all slices. build joint params of each slice for lmfit and put them in a temporary storage named pending_storage
-            a) fetch peak parameters, fix flags
-            b) fetch targets and convert to lmfit variables
-            c) fetch drivers and convert to lmfit variables
-            d) fetch a b in linear linking
-            e) fetch A, T, C in exponential linking. Convert T to k with k = 1/T to pass to optimizer
-        
-        3) check all the slices and write lmfit expression, exp=..., that can be inputed to optimizer 
-
-        Return  params_all, slice_ctxs, report for on_fitting_joint and debug
-        """
-        """
-        New version: do ALL linking in ParamRef-space.
-        lmfit names are produced ONLY by fmt_pref(ParamRef).
-        Naming rule: s{sid}_p{pid}_{name}
-        Globals use pid=-1: s{sid}_p-1_mult, etc.
-        """
-        # 1) common display / context
-        self.current_settings()
-        axis_mode = str(self.axis_mode).lower()
-        ref_MHz   = float(self.ref)
-        sw_hz     = float(self.sw_hz)
-        x_disp = self.f2_ppm if (axis_mode == "ppm") else self.f2_hz
-
-        params_all = Parameters()
-        slice_ctxs: list[tuple[int, "FitContext", list["Peak"], list[tuple[bool,bool,bool,bool]]]] = []
-        report = {"errors": [], "applied_linear": [], "T_results": {}}
-
-        if x_disp is None:
-            report["errors"].append("Display axis is not available.")
-            return params_all, slice_ctxs, report
-        x_disp = x_disp.astype(float)
-
-        slice_times = getattr(self, "t_f1", None)
-        if slice_times is None:
-            slice_times = getattr(self, "slice_times", None)
-
-        # 2a) build all per-slice params (using ctx.build_params that emits ParamRef-based names)
-        joint_slices = sorted(set(int(s) for s in indices))
-        for sid in joint_slices:
-            st = self.slice_states.get(sid)
-            if st is None:
-                if not self._bind_slice_direct(sid):
-                    continue
-                peaks, fix_flags, _ = self.peak_model.return_model()
-                peaks = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks]
-            else:
-                peaks = [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in (st.peaks or [])]
-                if st.fix_flags and len(st.fix_flags) >= len(peaks):
-                    fix_flags = [tuple(ff) for ff in st.fix_flags[:len(peaks)]]
-                else:
-                    _, fix_flags2, _ = self.peak_model.return_model()
-                    fix_flags = [tuple(ff) for ff in (fix_flags2[:len(peaks)] if fix_flags2 else [])]
-
-            if not peaks:
-                continue
-
-            y_slice = self.data2d[sid, :].astype(float)
-            ctx = FitContext(x_disp, y_slice, axis_mode, ref_MHz, sw_hz)
-            ctx.mask_w = self._mask_from_excluded(x_disp)
-
-            # IMPORTANT: build_params must now create:
-            #   s{sid}_p-1_mult, s{sid}_p-1_offset, s{sid}_p-1_phi0_deg
-            #   s{sid}_p{i}_pos/amp/lor/gauss
-            p_s = ctx.build_params(
-                peaks=peaks,
-                sid=sid,
-                multiplier=self.multiplier,
-                offset=self.offset,
-            )
-            for name, par in p_s.items():
-                params_all.add(par)
-
-            # bounds (use ParamRef directly)
-            for pid in range(len(peaks)):
-                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "pos"))],   self.peak_model, sid, pid, "pos",   axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "gauss"))], self.peak_model, sid, pid, "gauss", axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "amp"))],   self.peak_model, sid, pid, "amp",   axis_mode, ref_MHz)
-                apply_bounds_to_param(params_all[fmt_pref(ParamRef(sid, pid, "lor"))],   self.peak_model, sid, pid, "lor",   axis_mode, ref_MHz)
-
-            # fallback bounds if model does not provide
-            for pid in range(len(peaks)):
-                for nm, default_max in (("lor", 10000.0), ("gauss", 10000.0)):
-                    pref = ParamRef(slice_id=sid, peak_id=pid, name=nm)
-                    b = self.peak_model.get_bounds_for(pref) if self.peak_model else None
-                    if not (b and b.is_set()):
-                        k = fmt_pref(pref)
-                        params_all[k].min = 0.0
-                        params_all[k].max = float(default_max)
-
-                prefA = ParamRef(slice_id=sid, peak_id=pid, name="amp")
-                bA = self.peak_model.get_bounds_for(prefA) if self.peak_model else None
-                if not (bA and bA.is_set()):
-                    params_all[fmt_pref(prefA)].min = 0.0
-
-            # global fixed flags (globals are pid=-1 now)
-            params_all[fmt_pref(global_ref(sid, "mult"))].set(vary=not self.fix_mult,   value=self.multiplier)
-            params_all[fmt_pref(global_ref(sid, "phi0_deg"))].set(vary=not self.fix_phi0, value=self.phi0_deg)
-            params_all[fmt_pref(global_ref(sid, "offset"))].set(vary=not self.fix_offset, value=self.offset)
-
-            # per-peak fixed flags
-            for pid in range(len(peaks)):
-                fpos, famp, flor, fgauss = fix_flags[pid]
-                params_all[fmt_pref(ParamRef(sid, pid, "pos"))].vary   = not fpos
-                params_all[fmt_pref(ParamRef(sid, pid, "amp"))].vary   = not famp
-                params_all[fmt_pref(ParamRef(sid, pid, "lor"))].vary   = not flor
-                params_all[fmt_pref(ParamRef(sid, pid, "gauss"))].vary = not fgauss
-
-            slice_ctxs.append((sid, ctx, [Peak(p.pos, p.amp, p.lor_hz, p.gauss_disp) for p in peaks], fix_flags))
-
-        if not slice_ctxs:
-            report["errors"].append("No slices with peaks to fit.")
-            return params_all, slice_ctxs, report
-
-        # 2b) collect links (store ParamRef, not strings)
-        pending_linear: list[tuple["ParamRef", "ParamRef", float, float]] = []
-        # (tgt_ref, drv_ref, a, b)
-        pending_exp: list[tuple["ParamRef", "ParamRef", float, float, str, float]] = []
-        # (tgt_ref, drv_ref, A_val, t_sec, k_term, C_val)
-
-        t_by_kname: dict[str, list[float]] = {} # k__T_name → list of t_sec used
-        Tname_for_k: dict[str, str] = {} # k__T_name → T_name
-
-        for sid in joint_slices:
-            try:
-                reg_ = FitOrchestrator.build_registry_for_slice(sid)._
-                reg = reg_._seed_external_drivers_into_registry(
-                    registry=reg,
-                    slice_states=self.slice_states,
-                    current_slice_id=sid,
-                    links=self.link_store,
-                    strict=True,
-                )
-                links_subset = _links_for_target_slice(self.link_store, sid)
-
-                for pref_tgt, _entry in reg.items():
-                    if int(pref_tgt.slice_id) != sid:
-                        continue
-                    if not self.link_store.is_linked(pref_tgt):
-                        continue
-
-                    tgt_name = canon_name(pref_tgt.name)
-                    if tgt_name not in ("pos", "amp", "lor", "gauss"):
-                        continue
-
-                    tgt_ref = ParamRef(slice_id=int(pref_tgt.slice_id),
-                                       peak_id=int(pref_tgt.peak_id),
-                                       name=tgt_name)
-
-                    expr = links_subset.get(pref_tgt)
-                    if not expr or expr.driver is None:
-                        continue
-
-                    drv = expr.driver
-                    drv_name = canon_name(drv.name)
-                    if drv_name not in ("pos", "amp", "lor", "gauss"):
-                        report["errors"].append(
-                            f"Link target {fmt_pref(tgt_ref)} has unsupported driver name '{drv.name}'."
-                        )
-                        return params_all, slice_ctxs, report
-
-                    drv_ref = ParamRef(slice_id=int(drv.slice_id),
-                                       peak_id=int(drv.peak_id),
-                                       name=drv_name)
-
-                    if expr.type == LinkType.LINEAR:
-                        a = float(expr.args.get("a", 1.0))
-                        b = float(expr.args.get("b", 0.0))
-                        pending_linear.append((tgt_ref, drv_ref, a, b))
-                        continue
-
-                    # Check if it's RELAX_DECAY type
-                    try:
-                        rule = LinkExpr_to_ConstraintRule(expr)
-                        is_relax = isinstance(rule, RelaxDecayConstraint)
-                    except Exception:
-                        is_relax = False
-                    
-                    if is_relax:
-                        A_val = float(expr.args.get("A", 1.0))
-
-                        # time term
-                        if "t_override" in expr.args:
-                            t_sec = float(expr.args["t_override"])
-                        else:
-                            if slice_times is None:
-                                report["errors"].append(
-                                    f"Exponential link on {fmt_pref(tgt_ref)} requires time data "
-                                    "(load time_echo.txt or set t_override)."
-                                )
-                                return params_all, slice_ctxs, report
-                            try:
-                                t_sec = float(slice_times[sid])
-                            except Exception:
-                                report["errors"].append(
-                                    f"Exponential link on {fmt_pref(tgt_ref)} cannot find time for slice {sid}."
-                                )
-                                return params_all, slice_ctxs, report
-
-                        # k term (shared fitted k__T_name, or numeric literal)
-                        if "T_name" in expr.args:
-                            T_name = str(expr.args["T_name"]).strip()
-                            if not T_name:
-                                report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has empty T_name.")
-                                return params_all, slice_ctxs, report
-
-                            k_name = f"k__{T_name}"
-                            Tname_for_k[k_name] = T_name
-                            t_by_kname.setdefault(k_name, []).append(float(t_sec))
-
-                            if k_name not in params_all:
-                                params_all.add(k_name, value=1000.0, min=1e-9)
-                                params_all[k_name].set(vary=True)
-
-                            seed_for_T = _get_seed(self, T_name)
-                            if isinstance(seed_for_T, dict):
-                                k_lo, k_hi = _T_bounds_to_k_bounds(seed_for_T.get("T_lo_s"), seed_for_T.get("T_hi_s"))
-                                apply_Tbounds_to_param(params_all[k_name], k_lo, k_hi)
-
-                            report["T_results"].setdefault(T_name, []).append(fmt_pref(tgt_ref))
-                            k_term = k_name
-
-                        elif "T_value" in expr.args:
-                            T_val = float(expr.args["T_value"])
-                            if T_val <= 0:
-                                report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has non-positive T_value.")
-                                return params_all, slice_ctxs, report
-                            k_term = f"{(1.0 / T_val):.12g}"
-
-                        elif "T" in expr.args:
-                            T_val = float(expr.args["T"])
-                            if T_val <= 0:
-                                report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has non-positive T.")
-                                return params_all, slice_ctxs, report
-                            k_term = f"{(1.0 / T_val):.12g}"
-
-                        else:
-                            report["errors"].append(f"Exponential link on {fmt_pref(tgt_ref)} has no T_name nor T_value.")
-                            return params_all, slice_ctxs, report
-
-                        C_val = float(expr.args.get("C", 0.0))
-                        pending_exp.append((tgt_ref, drv_ref, A_val, float(t_sec), str(k_term), float(C_val)))
-                        continue
-
-            except Exception as e:
-                report["errors"].append(f"Link error (slice {sid}): {e}")
-                return params_all, slice_ctxs, report
-
-        # --- finalize per-T_name bounds and seed k initial values  ---
-        eps = 0.001
-        for k_name, t_list in t_by_kname.items():
-            t_pos = [abs(float(t)) for t in t_list if t is not None]
-            if not t_pos:
-                continue
-
-            t_min = min(t_pos)
-            t_max = max(t_pos)
-
-            k_min_data = eps / t_max
-            k_max_data = 14.0 / t_min
-
-            if k_name not in params_all:
-                continue
-            par = params_all[k_name]
-
-            old_min = par.min
-            old_max = par.max
-
-            new_min = max(0.0, float(k_min_data))
-            new_max = float(k_max_data)
-
-            if old_min is not None:
-                try: new_min = max(new_min, float(old_min))
-                except Exception: pass
-            if old_max is not None:
-                try: new_max = min(new_max, float(old_max))
-                except Exception: pass
-
-            if not np.isfinite(new_min) or not np.isfinite(new_max):
-                if np.isfinite(old_min): new_min = float(old_min)
-                if np.isfinite(old_max): new_max = float(old_max)
-
-            if new_max <= new_min:
-                span = max(abs(new_min), 1.0) * 1e-3
-                new_max = new_min + span
-
-            par.min = new_min
-            par.max = new_max
-
-            T_name = Tname_for_k.get(k_name, "")
-            seed = _get_seed(self, T_name) if T_name else None
-            if isinstance(seed, dict):
-                fixed = bool(seed.get("fixed", False))
-                T_seed_s = seed.get("T_seed_s", None)
-                if T_seed_s and T_seed_s > 0:
-                    k_seed = 1.0 / float(T_seed_s)
-                    if par.min is not None: k_seed = max(k_seed, float(par.min))
-                    if par.max is not None: k_seed = min(k_seed, float(par.max))
-                    par.set(value=k_seed)
-                par.set(vary=not fixed)
-                report.setdefault("T_seed_applied", {})[T_name] = {
-                    "fixed": fixed,
-                    "T_seed": float(T_seed_s) if T_seed_s else None,
-                    "k_bounds": (par.min, par.max),
-                }
-
-        # 3) Apply links (only here convert ParamRef -> lmfit name)
-        try:
-            missing = []
-
-            # 3a) linear
-            for tgt_ref, drv_ref, a, b in pending_linear:
-                tgt_key = fmt_pref(tgt_ref)
-                drv_key = fmt_pref(drv_ref)
-
-                if tgt_key not in params_all:
-                    missing.append(f"target {tgt_key}")
-                    continue
-                if drv_key not in params_all:
-                    missing.append(f"driver {drv_key}")
-                    continue
-
-                par = params_all[tgt_key]
-                par.set(expr=f"{a}*{drv_key}+{b}")
-                report["applied_linear"].append((tgt_key, drv_key))
-                try:
-                    par.min = -np.inf
-                    par.max =  np.inf
-                except Exception:
-                    pass
-
-            # 3b) exponential
-            for tgt_ref, drv_ref, A_val, t_sec, k_term, C_val in pending_exp:
-                tgt_key = fmt_pref(tgt_ref)
-                drv_key = fmt_pref(drv_ref)
-
-                if tgt_key not in params_all:
-                    missing.append(f"target {tgt_key} (exponential)")
-                    continue
-                if drv_key not in params_all:
-                    missing.append(f"driver {drv_key} (exponential)")
-                    continue
-
-                par = params_all[tgt_key]
-                par.set(expr=f"{drv_key}*({A_val})*exp(-({t_sec})*{k_term})+{C_val:.6g}")
-                try:
-                    par.min = -np.inf
-                    par.max =  np.inf
-                except Exception:
-                    pass
-
-            if missing:
-                report["errors"].append("Cannot apply links; missing: " + "; ".join(missing))
-                return params_all, slice_ctxs, report
-
-            # sanity: linked targets should be derived (expr set) and not vary
-            bad = []
-            for tgt_ref, _drv_ref, _a, _b in pending_linear:
-                tgt_key = fmt_pref(tgt_ref)
-                if tgt_key in params_all:
-                    tpar = params_all[tgt_key]
-                    if not getattr(tpar, "expr", ""):
-                        bad.append(f"{tgt_key} (no expr)")
-                    elif getattr(tpar, "vary", True):
-                        bad.append(f"{tgt_key} (vary=True)")
-            if bad:
-                report["errors"].append("Some linked targets are not derived parameters: " + "; ".join(bad))
-                return params_all, slice_ctxs, report
-
-        except Exception as e:
-            report["errors"].append(f"Joint Fit – Expression error: {e}")
-            return params_all, slice_ctxs, report
-
-        return params_all, slice_ctxs, report
-
     
     def on_show_statistics(self):
         stats = getattr(self, "fit_stats", None)
@@ -6320,9 +5701,6 @@ class  MainWindow(QMainWindow):
         if dlg: 
             try: dlg.model.refresh()
             except Exception: pass
-
-
-
    
     def on_simulate(self):
         try:
