@@ -104,8 +104,7 @@ from constraint_rules import (
     LinkEngine,
     ParseContext,
     RelaxDecayConstraint,
-    LinkExpr_to_ConstraintRule,
-    ConstraintRule_to_LinkExpr,
+    RelaxGrowthConstraint,
     ConstraintStore,
     ConstraintValidationError,
     FitOrchestrator,
@@ -334,7 +333,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     # --------------- UI helpers ---------------
     def _norm_type(self, t: str) -> str:
         t = (t or "").strip().upper()
-        return t if t in ("LINEAR", "RELAX_DECAY") else "LINEAR"
+        return t if t in ("LINEAR", "RELAX_DECAY", "RELAX_GROWTH") else "LINEAR"
 
     def _target_pref_from_row(self, row: int):
         self._ensure_row_targets_len(row)

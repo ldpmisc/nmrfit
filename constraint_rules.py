@@ -217,6 +217,8 @@ def resolve_constraint_type(type_txt: str) -> "ConstraintType":
         return ConstraintType.LINEAR
     if t in ("RELAX_DECAY", "RELAX", "DECAY", "EXP_DECAY"):
         return ConstraintType.RELAX_DECAY
+    if t in ("RELAX_GROWTH", "GROWTH", "EXP_GROWTH"):
+        return ConstraintType.RELAX_GROWTH
     raise ValueError(f"Unknown constraint type '{type_txt}'")
 
 def dispatch_rule_from_ui(
@@ -951,12 +953,14 @@ class RelaxDecayConstraint(ConstraintRule):
         T_name = out.get("T_name", None)
         T_number = out.get("T_number", None)
 
+        main = f'{drv}*exp(-{t_override}/{T_number})' if T_number is not None else f'{drv}*exp(-{t_override}/{T_name})'
+
         if A == 1.0 and C == 0.0:
-            return f'{drv}*exp(-{t_override}/{T_number})' if T_number is not None else f'{drv}*exp(-{t_override}/{T_name})'
+            return main
         if A != 1.0 and C == 0.0:
-            return f'{A}*{drv}*exp(-{t_override}/{T_number})' if T_number is not None else f'{A}*{drv}*exp(-{t_override}/{T_name})'
+            return f'{A}*{main}'
         if C != 0.0:
-            return f'{A}*{drv}*exp(-{t_override}/{T_number}) + {C}' if T_number is not None else f'{A}*{drv}*exp(-{t_override}/{T_name}) + {C}'
+            return f'{A}*{main}+{C}'
     
     def to_display_expr(self) -> str:
         """Safely call expr_txt or construct expr from self if expr_txt is none."""
@@ -971,12 +975,14 @@ class RelaxDecayConstraint(ConstraintRule):
         T_name = self.T_name
         T_number = self.T_number
 
+        main = f'{drv}*exp(-{t_override}/{T_number})' if T_number is not None else f'{drv}*exp(-{t_override}/{T_name})'
+
         if A == 1.0 and C == 0.0:
-            return f'{drv}*exp(-{t_override}/{T_number})' if T_number is not None else f'{drv}*exp(-{t_override}/{T_name})'
+            return main
         if A != 1.0 and C == 0.0:
-            return f'{A}*{drv}*exp(-{t_override}/{T_number})' if T_number is not None else f'{A}*{drv}*exp(-{t_override}/{T_name})'
+            return f'{A}*{main}'
         if C != 0.0:
-            return f'{A}*{drv}*exp(-{t_override}/{T_number}) + {C}' if T_number is not None else f'{A}*{drv}*exp(-{t_override}/{T_name}) + {C}'
+            return f'{A}*{main}+{C}'
 
     def to_lmfit_expr(self) -> str:
         """Return lmfit-compatible expression string."""
@@ -1132,7 +1138,7 @@ class RelaxDecayConstraint(ConstraintRule):
                 )
         
         # Check time availability (either explicit or from slice_states)
-        if self.time_s is None and self.T_name is None:
+        if self.time_s is None:
             # Try to get from slice_states as fallback
             slice_id = int(target_pref.slice_id)
             state = slice_states.get(slice_id)
@@ -1279,6 +1285,603 @@ class RelaxDecayConstraint(ConstraintRule):
                         Tseed_registry=Tseed_registry,
                     )
 
+class RelaxGrowthConstraint(ConstraintRule):
+    """
+    Relaxation exponential growth constraint: target = driver * A * (1 - exp(-t / T)) + C
+
+    """
+    
+    def __init__(
+        self,
+        target_pref: ParamRef,
+        driver_pref: ParamRef,
+        A: float = 1.0,
+        C: float = 0.0,
+        time_s: Optional[float] = None,
+        T_number: Optional[float] = None,
+        T_name: Optional[str] = None,
+        expr_txt: str = "",
+        enabled: bool = True
+    ):
+        """
+        Initialize a relaxation exponential growth constraint.
+        
+        Args:
+            target_pref: Parameter being constrained
+            driver_pref: Parameter driving the growth
+            A: Amplitude multiplicative factor
+            C: Baseline offset
+            time_s: Explicit time value (overrides T_name lookup)
+            T_number: Growth time constant (seconds) can be None if T_name used
+            T_name: Name of time constant can be None if T_seconds used
+            enabled: Whether this constraint is active
+        """
+        self.target_pref = target_pref
+        self.driver_pref = driver_pref
+        self.A = float(A)
+        self.C = float(C)
+        self.time_s = float(time_s) if time_s is not None else None
+        self.T_number = float(T_number) if T_number is not None else None
+        self.T_name = T_name
+        self.enabled = bool(enabled)
+        self.expr_txt = str(expr_txt or "")
+    
+    @property
+    def constraint_type(self) -> ConstraintType:
+        return ConstraintType.RELAX_GROWTH
+    
+    @staticmethod
+    def _split_left_mul(left: str) -> tuple[float, str]:
+        """
+        Parse the left-of-exp multiplicative chain, e.g.:
+          "3*s1_p0_amp*" or "s1_p0_amp*3*" or "2 * s1_p0_amp * 0.5 *"
+        Returns (A, driver_txt).
+        """
+        # Remove trailing '*' if present and strip whitespace
+        s = left.strip()
+        if s.endswith("*"):
+            s = s[:-1].strip()
+    
+        # Split by '*' and clean tokens
+        parts = [p.strip() for p in s.split("*") if p.strip()]    
+    
+        A = 1.0
+        driver_parts: list[str] = []
+    
+        for p in parts:
+            # accept plain floats like "3", "0.5", "1e-3"
+            if is_float(p):
+                A *= float(p)
+            else:
+                driver_parts.append(p)
+    
+        if len(driver_parts) != 1:
+            raise ValueError(f"Expected exactly one driver term before exp(...), got: {driver_parts!r} from '{left}'")
+    
+        return A, driver_parts[0]
+
+    @classmethod
+    def parse_rhs(cls, UI_rhs_raw: str) -> Dict:
+        """
+        Parse RHS for growth. Accepts either:
+          1) canonical growth form:
+             "A*driver*(1-exp(-t/T_name)) + C"
+             "driver*(1 - exp(-0.1/0.035))"
+          2) legacy/decay-like RHS (for backward compatibility / quick typing):
+             "A*driver*exp(-t/T_name) + C"
+        Returns dict keys: A, driver_txt, C, t_override, T_name, T_number.
+        """
+        raw0 = (UI_rhs_raw or "").strip()
+        if not raw0:
+            raise ValueError("Empty exponential constraint expression.")
+
+        # Normalize: remove HTML break artifacts and whitespace that complicates parsing
+        raw = raw0.replace("<br>", "").replace("&nbsp;", " ").strip()
+        s = raw.replace(" ", "")
+        low = s.lower()
+
+        out: Dict[str, Any] = {}
+
+        # -------------------------
+        # Case A: growth canonical "(1-exp(...))" 
+        # -------------------------
+        # accept either "(1-exp(...))" or "(1-exp(...))" with optional outer parentheses already removed by whitespace stripping.
+        pat = "(1-exp("
+        idx_growth = low.find(pat)
+        if idx_growth != -1:
+            left = s[:idx_growth]  # e.g. "2*drv*" or "drv*" or "2*drv*"
+            # left should end with '*' typically, but _split_left_mul handles trailing '*'
+            A, driver_txt = cls._split_left_mul(left)
+            out["A"] = A
+            out["driver_txt"] = driver_txt
+
+            # Parse exp(...) inside the growth wrapper
+            exp_start = idx_growth + 3  # points at "exp(" in "(1-exp("
+            # exp_start should align with "exp("
+            if low[exp_start:exp_start + 4] != "exp(":
+                raise ValueError(f"Malformed growth expression near '{pat}' in '{UI_rhs_raw}'")
+
+            # Find exp closing ')'
+            exp_close = s.find(")", exp_start)
+            if exp_close == -1:
+                raise ValueError(f"Malformed growth expression, missing ')' in '{UI_rhs_raw}'")
+
+            main = s[exp_start + 4:exp_close]  # inside exp(...)
+            if not main.startswith("-"):
+                raise ValueError(f"Expected '-' at start of exponential argument in '{UI_rhs_raw}'")
+            if "/" not in main:
+                raise ValueError(f"Expected form like '-t/T' in '{UI_rhs_raw}'")
+            t_part, T_part = main.split("/", 1)
+
+            # t_override
+            try:
+                t_val = float(t_part[1:])  # skip leading '-'
+            except Exception:
+                raise ValueError(f"Invalid time term '{t_part}' in '{UI_rhs_raw}'")
+            out["t_override"] = t_val
+
+            # T is numeric or named
+            if is_float(T_part):
+                out["T_number"] = float(T_part)
+                out["T_name"] = None
+            else:
+                out["T_name"] = T_part
+                out["T_number"] = None
+
+            # After exp(...), expect '))' (closing exp + closing (1-exp...))
+            # We have consumed the ')' that closes exp(...); now we need one more ')'
+            if exp_close + 1 >= len(s) or s[exp_close + 1] != ")":
+                # allow a single ')' if user omitted outer parentheses, but prefer strictness
+                raise ValueError(f"Malformed growth expression, expected '))' after exp(...) in '{UI_rhs_raw}'")
+
+            rest = s[exp_close + 2:]  # after the growth wrapper
+            if rest:
+                if not (rest.startswith("+") or rest.startswith("-")):
+                    raise ValueError(f"Expected '+' or '-' after growth factor in '{UI_rhs_raw}'")
+                try:
+                    out["C"] = float(rest[1:])
+                except Exception:
+                    raise ValueError(f"Invalid C term '{rest}' in '{UI_rhs_raw}'")
+            else:
+                out["C"] = 0.0
+
+            return out
+
+        # -------------------------
+        # Case B: fallback to decay-like RHS "A*driver*exp(-t/T)+C"
+        # (useful for user convenience, still interpreted as growth by this class
+        #  via UItext_to_expr / to_display_expr / apply_to_lmfit)
+        # -------------------------
+        exp_idx = low.find("exp(")
+        if exp_idx == -1:
+            raise ValueError(f"Malformed exponential constraint expression: '{UI_rhs_raw}'")
+
+        left = s[:exp_idx - 1]  # left of "*exp("
+        right = s[exp_idx:]     # from "exp(" onward
+
+        A, driver_txt = cls._split_left_mul(left)
+        out = {"A": A, "driver_txt": driver_txt}
+
+        idx = right.find(")")
+        if idx == -1:
+            raise ValueError(f"Malformed exponential constraint expression, missing ')': '{UI_rhs_raw}'")
+        main = right[4:idx]  # inside exp(...)
+
+        if not main.startswith("-"):
+            raise ValueError(f"Expected '-' at start of exponential argument in '{UI_rhs_raw}'")
+        if "/" not in main:
+            raise ValueError(f"Expected form like '-t/T' in '{UI_rhs_raw}'")
+        t_part, T_part = main.split("/", 1)
+
+        out["t_override"] = float(t_part[1:])  # skip leading '-'
+
+        if is_float(T_part):
+            out["T_number"] = float(T_part)
+            out["T_name"] = None
+        else:
+            out["T_name"] = T_part
+            out["T_number"] = None
+
+        rest = right[idx + 1:]
+        if rest:
+            if not (rest.startswith("+") or rest.startswith("-")):
+                raise ValueError(f"Expected '+' or '-' after exp(...) in '{UI_rhs_raw}'")
+            out["C"] = float(rest[1:]) if rest[1:] else 0.0
+        else:
+            out["C"] = 0.0
+
+        return out
+
+    @classmethod
+    def parse_UItext(cls, UI_txt: str) -> Dict:
+        t = (UI_txt or "").strip()
+        low = t.lower()
+
+        # KV-style exp(...)
+        if low.startswith("exp(") and ("a=" in low or "t=" in low or "t_name=" in low or "c=" in low or "t_name" in low or "t_name" in low):
+            inner = t[t.find("(") + 1:t.rfind(")")]
+            kv = LinearConstraint.parse_kv(inner)
+
+            A = float(kv.get("A", 1.0))
+            C = float(kv.get("C", 0.0))
+            driver_txt = str(kv.get("driver", ""))
+
+            t_override = kv.get("t", None)
+            t_override = float(t_override) if t_override is not None and str(t_override).strip() != "" else None
+
+            T_name = kv.get("T_name", None)
+            T_number = kv.get("T", None)
+            T_number = float(T_number) if T_number is not None and str(T_number).strip() != "" else None
+            if T_name is not None and str(T_name).strip() == "":
+                T_name = None
+
+            return {
+                "A": A,
+                "driver_txt": driver_txt,
+                "C": C,
+                "t_override": t_override,
+                "T_name": str(T_name) if T_name is not None else None,
+                "T_number": T_number,
+            }
+
+        # RHS-only
+        if "=" not in t:
+            return cls.parse_rhs(t)
+
+        # full assignment lhs = rhs
+        _, rhs = t.split("=", 1)
+        return cls.parse_rhs(rhs.strip())
+
+    @staticmethod
+    def UItext_to_expr(UItext) -> str:
+        """
+        Convert UI expression text into canonical RHS growth expression:
+            A*drv*(1-exp(-t/T)) + C
+        """
+        out = RelaxGrowthConstraint.parse_UItext(UItext)
+        A = float(out.get("A", 1.0))
+        drv = (out.get("driver_txt", "") or "").strip()
+        C = float(out.get("C", 0.0))
+        t_override = out.get("t_override", None)
+        T_name = out.get("T_name", None)
+        T_number = out.get("T_number", None)
+
+        if t_override is None:
+            # Keep "t" symbolic if the user didn't provide it; interpret_ui will resolve to ctx time.
+            t_term = "t"
+        else:
+            t_term = str(float(t_override))
+
+        T_term = str(float(T_number)) if T_number is not None else str(T_name)
+
+        # canonical no-spaces form for robustness
+        base = f"{drv}*(1-exp(-{t_term}/{T_term}))"
+        if A != 1.0:
+            base = f"{A}*{base}"
+        if C != 0.0:
+            base = f"{base}+{C}"
+        return base
+
+    def to_display_expr(self) -> str:
+        s = (self.expr_txt or "").strip()
+        if s:
+            return s
+
+        drv = fmt_pref(self.driver_pref)
+        A = float(self.A)
+        C = float(self.C)
+        t_term = str(float(self.time_s)) if self.time_s is not None else "t"
+        T_term = str(float(self.T_number)) if self.T_number is not None else str(self.T_name)
+
+        base = f"{drv}*(1-exp(-{t_term}/{T_term}))"
+        if A != 1.0:
+            base = f"{A}*{base}"
+        if C != 0.0:
+            base = f"{base}+{C}"
+        return base
+    
+    def to_lmfit_expr(self) -> str:
+        """Return lmfit-compatible expression string."""
+        display_text = self.to_display_expr()
+        if self.T_number:
+            lmfit_text = display_text
+        if self.T_name:
+            lmfit_text = display_text.replace(f"{self.T_name}", f"k__{self.T_name}").replace("/", "*")
+        return lmfit_text
+    
+    @classmethod
+    def infer_driver_from_expr(cls, expr_txt: str) -> Optional[str]:
+        out = cls.parse_UItext(expr_txt)                
+        return out.get("driver_txt")
+    
+    @classmethod
+    def interpret_ui(
+        cls,
+        *,
+        target_pref: "ParamRef",
+        driver_txt: str,
+        expr_txt: str,
+        enabled: bool,
+        ctx: "ParseContext",
+    ) -> Optional["RelaxGrowthConstraint"]:
+        """Parse UI text, resolve time and T parameters, convert T→k, and call create_rule."""
+        
+        out = cls.parse_UItext(expr_txt)
+
+        # Extract components (with defaults)
+        A = float(out.get("A", 1.0))
+        C = float(out.get("C", 0.0))
+        T_number = out.get("T_number")     # numeric T in seconds (or None)
+        T_name_raw = out.get("T_name")     # registry key (or None)
+        T_name = (T_name_raw or "").strip() or None
+        t_override = out.get("t_override") # optional numeric time override (or None)
+        expr_driver_txt = (out.get("driver_txt", "") or "").strip()
+
+        # ---- driver resolution (UI cell wins; else infer from expr) ----
+        driver_pref = None
+        ui_driver_txt = (driver_txt or "").strip()
+        if ui_driver_txt:
+            try:
+                driver_pref = txt_to_pref(ui_driver_txt)
+            except Exception:
+                driver_pref = None
+
+        if driver_pref is None and expr_driver_txt:
+            try:
+                driver_pref = txt_to_pref(expr_driver_txt)
+            except Exception:
+                driver_pref = None
+
+        if driver_pref is None:
+            raise ValueError("RelaxGrowthConstraint requires a driver parameter.")
+
+        # ---- time resolution (override wins; else metadata) ----
+        time_s = ctx.resolve_time_s(slice_id=target_pref.slice_id, t_override_s=t_override)
+
+        # Basic input sanity: forbid both numeric and named T
+        if (T_number is not None) and (T_name is not None):
+            raise ValueError("Provide either numeric T or T_name, not both.")
+        if (T_number is None) and (T_name is None):
+            raise ValueError("RelaxGrowth requires either numeric T or T_name.")
+        if T_number is not None:
+            T_number = float(T_number)
+            if T_number <= 0:
+                raise ValueError(f"Numeric T must be > 0; got {T_number}.")
+
+        # Optional: ensure registry row exists early (UI feedback), but still do NOT resolve k
+        if T_name is not None:
+            _ = ctx.get_T_record(T_name)  # raises if unknown
+
+        return cls.create_rule(
+            target_pref=target_pref,
+            driver_pref=driver_pref,
+            A=A,
+            C=C,
+            time_s=time_s,
+            T_name=T_name,   # None if numeric T was used; registry T_name if used
+            T_number=T_number,
+            enabled=enabled,
+            expr_txt=expr_txt,
+        )
+        
+    @classmethod
+    def create_rule(
+        cls,
+        *,
+        target_pref: "ParamRef",
+        driver_pref: "ParamRef",
+        A: float = 1.0,
+        C: float = 0.0,
+        time_s: float,
+        T_name: Optional[str] = None,
+        T_number: Optional[float] = None,
+        expr_txt: str = "",
+        enabled: bool = True,
+    ) -> "RelaxGrowthConstraint":
+        """Construct RelaxGrowthConstraint from fully-resolved domain parameters.
+        
+        Args:
+            time_s: Time value in seconds for this slice
+            A: Amplitude coefficient
+            C: Constant offset
+            T_number: Optional numeric time constant for reference
+            T_name: Optional registry key for time constant"""
+        # Convert k back to T_number for storage if needed
+
+        return cls(
+            target_pref=target_pref,
+            driver_pref=driver_pref,
+            A=A,
+            C=C,
+            time_s=time_s,
+            T_number=T_number,
+            T_name=T_name,
+            expr_txt=expr_txt,
+            enabled=enabled,
+        )
+    
+    def validate(
+        self,
+        target_peak: Peak,
+        target_pref: ParamRef,
+        driver_peak: Optional[Peak],
+        driver_pref: Optional[ParamRef],
+        slice_states: Dict[int, Any]
+    ) -> List[str]:
+        """Validate exponential constraint semantic preconditions."""
+        errors = []
+        
+        # Driver must exist
+        if driver_peak is None or driver_pref is None:
+            errors.append(
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
+                f"driver peak s{self.driver_pref.slice_id}_p{self.driver_pref.peak_id} not found"
+            )
+        
+        # Validate T (if numeric) must be positive
+        if self.T_number is not None:
+            try:
+                T_val = float(self.T_number)
+                if T_val <= 0.0:
+                    errors.append(
+                        f"Exponential constraint on {fmt_pref(target_pref)}: "
+                        f"time constant T={T_val} must be positive"
+                    )
+            except (ValueError, TypeError):
+                errors.append(
+                    f"Exponential constraint on {fmt_pref(target_pref)}: "
+                    f"time constant T={self.T_number} is not a valid number"
+                )
+        
+        # Check time availability (either explicit or from slice_states)
+        if self.time_s is None:
+            # Try to get from slice_states as fallback
+            slice_id = int(target_pref.slice_id)
+            state = slice_states.get(slice_id)
+            t_available = False
+            if state is not None:
+                t_f1 = getattr(state, 't_f1', None)
+                if t_f1 is not None and hasattr(t_f1, '__getitem__'):
+                    try:
+                        _ = float(t_f1[slice_id])
+                        t_available = True
+                    except (IndexError, TypeError, ValueError):
+                        pass
+            
+            if not t_available:
+                errors.append(
+                    f"Exponential constraint on {fmt_pref(target_pref)}: "
+                    f"no time value available (no time_s or T_name, and slice_states has no t_f1)"
+                )
+            
+        # Validate coefficients
+        if not np.isfinite(self.A):
+            errors.append(
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
+                f"amplitude A={self.A} is not finite"
+            )
+        
+        if not np.isfinite(self.C):
+            errors.append(
+                f"Exponential constraint on {fmt_pref(target_pref)}: "
+                f"baseline C={self.C} is not finite"
+            )
+        
+        return errors
+        
+    def apply_to_lmfit(
+            self,
+            *,
+            params: Dict[str, Any],
+            registry: Dict[ParamRef, Dict[str, Any]],
+            allow_external: bool = False,
+            vary: bool = True,
+            Tseed_registry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        ) -> None:
+            """
+            Apply exponential decay constraint to lmfit.
+            
+            Same-slice: SUPPORTED for testing. Warn user. 
+            (relaxation constraints are inherently cross-slice, depending on time vectors)
+            Cross-slice: depends on mode
+              - Sequential (vary=False): compute value using T_number seed, freeze target. T_number (algebraic expr not used is not supported)
+              - Joint (vary=True): set algebraic expr with shared T parameter if T_name or T_number provided.
+            
+            Key difference from LINEAR:
+              - Requires time data (t) per slice
+              - Requires decay constant (T): numeric (T_number) or shared parameter (T_name)
+              - For joint mode: would need T_name added to params
+            """
+            target_pref = self.target_pref
+            target_key = fmt_pref(target_pref)            
+            if target_key not in params:
+                return
+            #get necessary values from rule
+            p_tgt = params[target_key]
+
+            drv_key = fmt_pref(self.driver_pref)
+            t_val = self.time_s
+            T_val = float(self.T_number) if self.T_number is not None else self.T_name
+            expr_lmfit = self.to_lmfit_expr()
+
+            # Determine if same-slice or cross-slice         
+            same_slice = int(self.driver_pref.slice_id) == int(target_pref.slice_id)
+            
+            # --- Internal (same-slice): allow for flexibility but warn user ---
+            # Relaxation constraints are inherently cross-slice (time-dependent)
+            # Only accept T_number (numeric) for same-slice use
+
+            if same_slice:
+                log.warning(
+                    f"RELAX_DECAY constraint on {target_key} is inherently time-dependent and require cross-slice driver but uses same-slice driver."
+                    f"Consider using LINEAR constraint instead for intra-slice relationships."
+                )              
+                if drv_key in params:
+                    if t_val is None:
+                        raise ValueError(
+                            f"RELAX_DECAY constraint on {target_key}: no time value available"
+                        )                                                   
+                    # Set algebraic dependency
+                    expr_lmfit = self.to_lmfit_expr()
+                    p_tgt.set(expr=expr_lmfit, vary=True)
+                    return
+                
+                # Fallback: driver not present → numeric freeze using registry
+                info = registry.get(self.driver_pref)
+                if not info or "value" not in info:
+                    raise ValueError(
+                        f"Missing driver value for internal RELAX_DECAY constraint: {fmt_pref(self.driver_pref)}"
+                    )               
+                drv_val = float(info["value"])
+                if t_val is None:
+                    raise ValueError(
+                        f"RELAX_DECAY constraint on {target_key}: no time value available"
+                    )
+                if is_float(T_val) and T_val >= 0:
+                    T_val = float(T_val)
+                    exp_term = (1 - np.exp(-t_val / T_val))
+                    val = drv_val * self.A * exp_term + self.C                
+                    p_tgt.set(value=float(val), expr=expr_lmfit, vary=True)
+                return
+            
+            # --- External (cross-slice) ---
+            if not allow_external:
+                raise ValueError(
+                    f"Cannot apply cross-slice RELAX_DECAY constraint on {target_key} when allow_external=False"
+                )
+            
+            if not vary:
+                # Sequential mode: freeze with computed value
+                # 2 cases T_number (numeric) or T_name (not supported)
+                # Get driver value from registry
+                info = registry.get(self.driver_pref)
+                if not info or "value" not in info:
+                    raise ValueError(f"Missing external driver value for {fmt_pref(self.driver_pref)}")
+                drv_val = float(info["value"])
+                # Compute: driver * A * (1 - exp(-t / T)) + C
+                if is_float(T_val) and T_val > 0: #T_number case
+                    T_val = float(T_val)
+                    exp_term = (1 - np.exp(-t_val / T_val))
+                    val = drv_val * self.A * exp_term + self.C                
+                    p_tgt.set(value=float(val), expr=expr_lmfit, vary=False)              
+                else: #T_val is not numeric but T_name
+                    raise ValueError(f"Sequential fitting does not support {T_val}")
+            else:
+                # Joint mode: algebraic expression with shared T parameter
+                # T_number -> RelaxGrowthConstraints acts like LinearConstraint with a = A*exp(-t/T_number)
+                if self.T_name or self.T_number is not None:
+                    p_tgt.set(expr=expr_lmfit, vary=True)
+                if self.T_name: # T_name -> convert T_name to k_name and inject k_name into parameter if not already present
+                    if Tseed_registry is None:
+                        raise ValueError(f"RELAX_GROWTH uses T_name='{self.T_name}' but tseed_registry was not provided.")
+                    # Create or update k__T in params with bounds/vary from registry
+                    ensure_k_param_in_lmfit(
+                        params=params,
+                        T_name=self.T_name,
+                        Tseed_registry=Tseed_registry,
+                    )
+
+
 class ConstraintRuleFactory:
     """
     Factory for creating constraint rules from serialized representations.
@@ -1293,104 +1896,6 @@ class ConstraintRuleFactory:
     def from_dict(self, dict) -> ConstraintStore:
         """Parse dictionary to constraint rule."""
         pass
-
-
-# ============================================================================
-# Migration Bridge: LinkExpr → ConstraintRule
-# ============================================================================
-
-def LinkExpr_to_ConstraintRule(link_expr) -> ConstraintRule:
-    """
-    Convert old LinkExpr to new ConstraintRule subclass.
-    
-    This function enables backward compatibility when loading existing fit files
-    that use the deprecated LinkExpr format. It infers the type from LinkExpr.type
-    property and creates appropriate ConstraintRule.
-    
-    Args:
-        link_expr: LinkExpr instance with target, driver, args, enabled
-        
-    Returns:
-        ConstraintRule subclass instance (LinearConstraint or RelaxDecayConstraint)
-        
-    Raises:
-        ValueError: if LinkExpr format is invalid
-    """
-    link_type = link_expr.type  # Use property to infer type from args
-    
-    if link_type == "LINEAR":
-        return LinearConstraint(
-            target_pref=link_expr.target,
-            driver_pref=link_expr.driver,
-            a=link_expr.args.get("a", 1.0),
-            b=link_expr.args.get("b", 0.0),
-            enabled=link_expr.enabled
-        )
-    
-    elif link_type == "RELAX_DECAY":
-        return RelaxDecayConstraint(
-            target_pref=link_expr.target,
-            driver_pref=link_expr.driver,
-            T_number=link_expr.args.get("T", 1.0),
-            A=link_expr.args.get("A", 1.0),
-            C=link_expr.args.get("C", 0.0),
-            time_s=link_expr.args.get("t_override"),
-            T_name=link_expr.args.get("T_name"),
-            k_seed=None,
-            enabled=link_expr.enabled
-        )
-    
-    else:
-        raise ValueError(f"Unknown link type inferred from LinkExpr: {link_type}")
-
-
-def ConstraintRule_to_LinkExpr(rule: ConstraintRule):
-    """
-    Convert new ConstraintRule to old LinkExpr format.
-    
-    This function enables backward compatibility when exporting to the old
-    LinkExpr format. It is the inverse of LinkExpr_to_ConstraintRule.
-    
-    Args:
-        rule: ConstraintRule subclass instance
-        
-    Returns:
-        LinkExpr instance with target, driver, args, enabled
-        
-    Raises:
-        ValueError: if rule type is unknown
-    """
-    # Import at function level to avoid circular dependency
-    from nmrFit_v0 import LinkExpr as _LinkExpr
-    
-    if isinstance(rule, LinearConstraint):
-        return _LinkExpr(
-            target=rule.target_pref,
-            driver=rule.driver_pref,
-            args={"a": rule.a, "b": rule.b},
-            enabled=rule.enabled
-        )
-    
-    elif isinstance(rule, RelaxDecayConstraint):
-        args = {
-            "T": rule.T_number,
-            "A": rule.A,
-            "C": rule.C
-        }
-        if rule.time_s is not None:
-            args["t_override"] = rule.time_s
-        if rule.T_name is not None:
-            args["T_name"] = rule.T_name
-        
-        return _LinkExpr(
-            target=rule.target_pref,
-            driver=rule.driver_pref,
-            args=args,
-            enabled=rule.enabled
-        )
-    
-    else:
-        raise ValueError(f"Unknown constraint rule type: {type(rule)}")
 
 @dataclass
 class ConstraintStore:
@@ -2129,4 +2634,4 @@ class ParseContext:
 
 register_constraint_rule(ConstraintType.LINEAR, LinearConstraint)
 register_constraint_rule(ConstraintType.RELAX_DECAY, RelaxDecayConstraint)
-register_constraint_rule(ConstraintType.RELAX_GROWTH, RelaxDecayConstraint)
+register_constraint_rule(ConstraintType.RELAX_GROWTH, RelaxGrowthConstraint)
