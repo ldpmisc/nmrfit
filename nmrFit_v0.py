@@ -104,6 +104,7 @@ from constraint_rules import (
     LinkEngine,
     ParseContext,
     RelaxDecayConstraint,
+    RelaxExpConstraintBase,
     RelaxGrowthConstraint,
     ConstraintStore,
     ConstraintValidationError,
@@ -1419,7 +1420,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                         continue
                                     
                 # If RELAX_DECAY with T_name, ensure registry row exists
-                if isinstance(constraint_rule, RelaxDecayConstraint):
+                if isinstance(constraint_rule, RelaxExpConstraintBase):
                     try:
                         Tn = getattr(constraint_rule, "T_name", None)
                         if isinstance(Tn, str) and Tn.strip():
