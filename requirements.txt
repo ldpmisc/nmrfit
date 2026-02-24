@@ -1,0 +1,5 @@
+numpy>=1.23
+scipy>=1.10
+lmfit>=1.2
+matplotlib>=3.7
+PyQt5>=5.15,<6.0
