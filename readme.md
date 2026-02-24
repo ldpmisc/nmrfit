@@ -117,13 +117,13 @@ Design principles:
 # 7. Installation
 
 Python ≥ 3.10 recommended.
-### 1. Clone the repository
+1. Clone the repository
 
 ```bash
 git clone https://github.com/ldpmisc/nmrfit.git
 cd nmrFit
 
-### 2. Create environment:
+2. Create environment
 
 ```
 conda create -n nmrfit python=3.11
