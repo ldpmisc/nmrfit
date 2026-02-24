@@ -120,7 +120,7 @@ Python ≥ 3.10 recommended.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/ldpmisc/nmrfit
+git clone https://github.com/ldpmisc/nmrfit.git
 cd nmrFit
 
 ### 2. Create environment:
