@@ -190,4 +190,23 @@ API may evolve.
 Interested users are encouraged to test with saturation-recovery data.
 Example data will be uploaded in the future.
 
+Currently only support .json input file but not raw data from NMR softwares like Bruker or MResNova.
+Current work-around is to load raw data using sSnake (https://doi.org/10.1016/j.jmr.2019.02.006, https://gitlab.science.ru.nl/mrrc/nmrzoo/ssnake) and export to .json file.
+The program will automaticlly detect 1D or 2D data. 
+
+Click add peak and follow direction at the bottom left corners to add a peaks. A peak will appear on the spectrum and peak table.
+Right click on a peak table to add constraint. Once clicked, a linkEditDialog shows up. Currently, the dialog only support 2 types of constraints, either Linear or RelaxDecayConstraint. Use the Dialog to set desired constraint.
+
+Another way to set constraint is to use LinkManagerDialog by click on Link Manager buttons. This supports an additional RelaxGrowthConstraint type by directly typing on the Table. It also supports import/export and mass generation of constraints. Follow the example, which located at the bottom of the Table to create proper constraints. 
+
+It is also possible to exclude a part of spectrum using "excluded" button.
+
+Before fitting, it is encouraged to click validate button below the peak table to ensure that all constraints make sense (e.g no cyclic dependents that means a parameter A depends on paramter B but at the same time B depends on A).
+
+To fit, click on fit button and select either "current slice", or "Sequential", or "Joint mode".
+
+After fitting, it is possible to examine certain statistic. This feature is under development.
+
+Click export to save the fit result in .txt file. 
+
 
