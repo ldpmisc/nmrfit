@@ -8,6 +8,20 @@ The software is designed for experiments where parameters evolve across slices (
 
 ---
 
+## Overview
+
+nmrFit is a Python-based nonlinear least-squares fitting framework designed for:
+- Multi-slice NMR data fitting
+- Cross-slice parameter linking
+- Constraint-based modeling
+- Statistical model evaluation (AIC, BIC, covariance analysis)
+
+It integrates `lmfit`, NumPy, and a structured constraint engine to enable reproducible, quantitative spectral analysis.
+
+---
+
+
+
 # 1. Scientific Motivation
 
 Conventional NMR spectral fitting often treats each spectrum independently:
