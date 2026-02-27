@@ -187,21 +187,21 @@ Planned directions:
 API may evolve.
 
 # 11. Example
-Interested users are encouraged to test with saturation-recovery data.
+Interested users are encouraged to test with saturation-recovery or Hanh echo data.
 Example data will be uploaded in the future.
 
-Currently only support .json input file but not raw data from NMR softwares like Bruker or MResNova.
-Current work-around is to load raw data using sSnake (https://doi.org/10.1016/j.jmr.2019.02.006, https://gitlab.science.ru.nl/mrrc/nmrzoo/ssnake) and export to .json file.
+Currently only support .json input file but not raw data from NMR softwares like Bruker or MNova.
+Current work-around is to load raw data using sSnake (https://doi.org/10.1016/j.jmr.2019.02.006, https://gitlab.science.ru.nl/mrrc/nmrzoo/ssnake) and export to a .json file.
 The program will automaticlly detect 1D or 2D data. 
 
-Click add peak and follow direction at the bottom left corners to add a peaks. A peak will appear on the spectrum and peak table.
-Right click on a peak table to add constraint. Once clicked, a linkEditDialog shows up. Currently, the dialog only support 2 types of constraints, either Linear or RelaxDecayConstraint. Use the Dialog to set desired constraint.
+Click add peak and follow the instructions at the bottom left corner to add a peak. A peak will appear on the spectrum and peak table.
+Right click on a peak table to add constraint. A constraint is a mathematical relations between two parameters used for a fitting. Addition of a constraint help reducing the number of independent fit variables. The dependent variable is called target, where the independent one is called driver, e.g driver --> target. Once clicked, a linkEditDialog shows up. Currently, the dialog only support 2 types of constraints, either Linear or RelaxDecayConstraint. Use the Dialog to set desired constraint.
 
-Another way to set constraint is to use LinkManagerDialog by click on Link Manager buttons. This supports an additional RelaxGrowthConstraint type by directly typing on the Table. It also supports import/export and mass generation of constraints. Follow the example, which located at the bottom of the Table to create proper constraints. 
+Another way to set constraint is to use LinkManagerDialog by click on Link Manager buttons. This supports an additional RelaxGrowthConstraint type by directly typing on the Table. The parameter names are follows the synmatic sXX_p_YY_name where s stands for s, p stands for peak, XX and YY are corresponding number, name can be amp (amplitude), pos (position), gauss (gaussian width), and lor (lorentizian width). An example is s0_p1_amp (amplitude of peak 1 in slice 0). The dialog also supports import/export and mass generation of constraints. Follow the examples, which located at the bottom of the Table, to create proper constraints. 
+
+Before fitting, it is encouraged to click validate button below the peak table to ensure that all constraints make sense (e.g no cyclic dependents that means a parameter A depends on paramter B but at the same time B depends on A). Note that each target can have only one driver and one relation. That means a target can not be controlled by 2 drivers, e.g A = B + C. However, one driver can be linked to multiple target, e.g A --> B and A --> C. A sequential relation such as A --> B --> C is also supported.
 
 It is also possible to exclude a part of spectrum using "excluded" button.
-
-Before fitting, it is encouraged to click validate button below the peak table to ensure that all constraints make sense (e.g no cyclic dependents that means a parameter A depends on paramter B but at the same time B depends on A).
 
 To fit, click on fit button and select either "current slice", or "Sequential", or "Joint mode".
 
