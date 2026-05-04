@@ -334,7 +334,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     # --------------- UI helpers ---------------
     def _norm_type(self, t: str) -> str:
         t = (t or "").strip().upper()
-        return t if t in ("LINEAR", "RELAX_DECAY", "RELAX_GROWTH") else "LINEAR"
+        return t if t in ("LINEAR", "RELAX DECAY", "RELAX GROWTH") else "LINEAR"
 
     def _target_pref_from_row(self, row: int):
         self._ensure_row_targets_len(row)
@@ -746,7 +746,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
             if type_item is None:
                 type_item = QtWidgets.QTableWidgetItem()
                 self.tbl.setItem(r, self.COL_TYPE, type_item)
-            type_item.setText("RELAX_DECAY")
+            type_item.setText("RELAX DECAY")
 
             # driver cell (if user gave driver)
             if driver_txt:
@@ -1371,6 +1371,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
         # Process rows and rebuild constraint store
         enabled_seen = 0
         failed_rows = []
+        target_first_seen = {}  # Track which row first defined each target
 
         for idx, row in enumerate(parsed_rows):
             is_enabled = row["enabled"] in ("1", "true", "True")
@@ -1414,7 +1415,26 @@ class LinkManagerDialog(QtWidgets.QDialog):
                 # Add to global ConstraintStore
                 if self._constraint_store is not None:
                     try:
+                        # Check if target already has a constraint (will be overwritten)
+                        existing = self._constraint_store.get_constraint(pref)
+                        if existing is not None and pref in target_first_seen:
+                            first_row = target_first_seen[pref]
+                            old_type = getattr(existing, 'constraint_type', None)
+                            new_type = getattr(constraint_rule, 'constraint_type', None)
+                            old_type_str = old_type.name if old_type else "unknown"
+                            new_type_str = new_type.name if new_type else "unknown"
+                            failed_rows.append(
+                                f"WARNING: Row {idx+1} ({target_txt}, {new_type_str}) overwrites "
+                                f"Row {first_row} ({old_type_str}). "
+                                f"Each target is controlled by one constraint."
+                            )
+                        
                         self._constraint_store.add_constraint(constraint_rule)
+                        
+                        # Track first occurrence of this target
+                        if pref not in target_first_seen:
+                            target_first_seen[pref] = idx + 1
+                        
                     except Exception as e:
                         failed_rows.append(f"Row {idx+1} ({target_txt}): store add failed: {e}")
                         continue
@@ -1720,7 +1740,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
         # Link type
         self.cmb_type = QtWidgets.QComboBox()
         self.cmb_type.addItem("Linear (target = driver*a + b)", "LINEAR")
-        self.cmb_type.addItem("Time decay (target = driver*A*exp(-t/T)+C)", "RELAX_DECAY")
+        self.cmb_type.addItem("Time decay (target = driver*A*exp(-t/T)+C)", "RELAX DECAY")
         self.cmb_type.setCurrentIndex(0 if default_is_linear else 1)
         layout.addRow("Type:", self.cmb_type)
 
@@ -1923,7 +1943,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
         return (norm, True)
 
     def _update_preview(self):
-        # Only for RELAX_DECAY
+        # Only for RELAX DECAY
         if self.cmb_type.currentData() != ConstraintType.RELAX_DECAY:
             self.lbl_prev_human.setText("")
             self.lbl_prev_engine.setText("")
@@ -2083,7 +2103,7 @@ class LinkEditorDialog(QtWidgets.QDialog):
             return linear_rule
 
         # 3) RELAX_DECAY path: build expr_txt then dispatch
-        if type_txt == "RELAX_DECAY":
+        if type_txt == "RELAX DECAY":
             A_val = float(self.spn_A.value())
             C_val = float(self.spn_C.value())
 
@@ -3458,7 +3478,7 @@ class MplCanvas(FigureCanvas):
 
 
 # ---------------------------- Main GUI window ------------------------------
-class  MainWindow(QMainWindow):
+class  MainWindow( QMainWindow):
     @property
     def peaks(self): 
         return self.slice_states[self.slice_index].peaks
@@ -5211,6 +5231,7 @@ class  MainWindow(QMainWindow):
             self.current_settings()
             mask_w = self._mask_from_excluded(self.x)
 
+
             # 3) Build context and LMFit params
             ctx = FitContext(self.x, self.y, self.axis_mode, self.ref, self.sw_hz)
             ctx.mask_w = mask_w
@@ -5274,8 +5295,7 @@ class  MainWindow(QMainWindow):
                     method='least_squares', max_nfev=5000,
                     ftol=1e-8, xtol=1e-8, gtol=1e-8, x_scale='jac', loss='soft_l1'
                 )
-
-                self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Single Fit", slice_indices_list=[sid])
+                self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Single Fit", slice_indices_list=[sid], ref_MHz=self.ref)
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, 'Fit error', str(e))
                 return  # finally{} will end_busy()
@@ -5542,7 +5562,7 @@ class  MainWindow(QMainWindow):
                 method='least_squares', max_nfev=5000,
                 ftol=1e-8, xtol=1e-8, gtol=1e-8, loss='soft_l1', x_scale='jac'                
             )
-            self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Joint Fit", slice_indices_list=indices)
+            self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Joint Fit", slice_indices_list=indices, ref_MHz=self.ref)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, 'Joint Fit error', str(e))
             try: self._end_busy()
@@ -5843,7 +5863,7 @@ class  MainWindow(QMainWindow):
         is_ppm = (getattr(self, "axis_mode", "hz").lower() == "ppm")
         MHz = float(self.ref)
         x_hz = x_disp * MHz if is_ppm else x_disp
-        x_ppm = x_hz / MHz
+        x_ppm = x_hz / MHz 
         y_data = np.asarray(self.y, dtype=float)
         # --- Build t, fid, spec via orchestrator (math only) ---
         # (No phasing/offset here; matches residual/preview core.)
