@@ -1,0 +1,18 @@
+﻿# Program	mpFit
+# SavedUTC	2025-11-19T12:34:30Z
+# DataFile	13.json
+# AxisMode	ppm
+# SliceIndex	0
+# Redchi	0.9465168774995372
+# Ref_Hz	161.966766752
+# Globals	offset=0; multiplier=1000000000.000; phi0_deg=0.000
+# GlobalsFix	offset=1; multiplier=1; phi0_deg=1
+# Excluded	[ {x_min=-295.800, x_max=45.000}, {x_min=120.000, x_max=475.700} ]
+
+id	pos	pos_fix	amp	amp_fix	lor_hz	lor_fix	gauss_disp	gauss_fix	notes
+p0	89.387	0	3593.934	0	10.000	1	6.380	0
+p1	77.794	0	1094.838	0	10.000	1	5.439	0
+p2	85.337	0	661.886	0	10.000	1	5.265	0
+p3	82.159	0	2255.677	0	10.000	1	14.211	0
+p4	104.875	0	552.702	0	10.000	1	8.899	0
+p5	82.057	0	198.615	0	10.000	1	2.028	0

@@ -1,0 +1,22 @@
+# Program	mpFit
+# SavedUTC	2025-11-03T11:12:47Z
+# DataFile	31-insert.json
+# Kind	LinkTable
+# SliceCount	6
+# PeaksPerSlice	6
+# NumberOfEnabledLinks	12
+# NumberOfRows	12
+
+enabled	target	type	driver	expr
+1	s0_p0_pos	LINEAR	s6_p0_pos	1*s6_p0_pos
+1	s1_p0_pos	LINEAR	s6_p0_pos	1*s6_p0_pos
+1	s2_p0_pos	LINEAR	s6_p0_pos	1*s6_p0_pos
+1	s3_p0_pos	LINEAR	s6_p0_pos	1*s6_p0_pos
+1	s4_p0_pos	LINEAR	s6_p0_pos	1*s6_p0_pos
+1	s5_p0_pos	LINEAR	s6_p0_pos	1*s6_p0_pos
+1	s0_p0_amp	RELAX_EXP	s6_p0_amp	s6_p0_amp*1*exp(--0.008/t_0+0)
+1	s1_p0_amp	RELAX_EXP	s6_p0_amp	s6_p0_amp*1*exp(--0.007/t_0+0)
+1	s2_p0_amp	RELAX_EXP	s6_p0_amp	s6_p0_amp*1*exp(--0.006/t_0+0)
+1	s3_p0_amp	RELAX_EXP	s6_p0_amp	s6_p0_amp*1*exp(--0.005/t_0+0)
+1	s4_p0_amp	RELAX_EXP	s6_p0_amp	s6_p0_amp*1*exp(--0.004/t_0+0)
+1	s5_p0_amp	RELAX_EXP	s6_p0_amp	s6_p0_amp*1*exp(--0.003/t_0+0)
