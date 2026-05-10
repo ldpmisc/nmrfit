@@ -1702,7 +1702,7 @@ class JCouplingConstraint(ConstraintRule):
 class JModulationConstraint(ConstraintRule):
     """
     Hahn-echo J-modulation amplitude constraint:
-        amp_target = amp_driver * A * cos(pi * J * time) * exp(-2*time/T2) + C
+        amp_target = amp_driver * A * cos(pi * J * time) * exp(-time/T2) + C
 
     The time variable is stored as time_s and may be entered as time=... or t=...
     in LinkManager. J is in Hz. T2 is in seconds.
@@ -1851,7 +1851,7 @@ class JModulationConstraint(ConstraintRule):
         if self.time_s is None:
             raise ValueError("JModulationConstraint requires time_s.")
         time_s = float(self.time_s)
-        return float(np.cos(np.pi * float(J_Hz) * time_s) * np.exp(-2.0 * time_s / float(T2_s)))
+        return float(np.cos(np.pi * float(J_Hz) * time_s) * np.exp(-1.0 * time_s / float(T2_s)))
 
     def _factor_expr(self) -> str:
         if self.time_s is None:
@@ -1859,8 +1859,8 @@ class JModulationConstraint(ConstraintRule):
         t = float(self.time_s)
         J = self._j_term_for_expr()
         if self.T2_name:
-            return f"cos({float(np.pi)}*{J}*{t})*exp(-2.0*{t}*{self._t2_term_for_expr()})"
-        return f"cos({float(np.pi)}*{J}*{t})*exp(-2.0*{t}/{self._t2_term_for_expr()})"
+            return f"cos({float(np.pi)}*{J}*{t})*exp(-1.0*{t}*{self._t2_term_for_expr()})"
+        return f"cos({float(np.pi)}*{J}*{t})*exp(-1.0*{t}/{self._t2_term_for_expr()})"
 
     def to_display_expr(self) -> str:
         s = (self.expr_txt or "").strip()
