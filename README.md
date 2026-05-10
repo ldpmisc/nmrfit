@@ -202,7 +202,7 @@ API may evolve.
 
 # 11. Example
 Interested users are encouraged to test with saturation-recovery or Hanh echo data.
-Example data, peaks, and constraints file were uploaded. Click on File -> Open to load the .json data file. Click on File -> Import peak table to open _fit.txt file. Click on Link Manager -> Import to load test_links_partial_data.txt file
+Example data will be uploaded in the future.
 
 Currently only support .json input file but not raw data from NMR softwares like Bruker or MNova.
 Current work-around is to load raw data using sSnake (https://doi.org/10.1016/j.jmr.2019.02.006, https://gitlab.science.ru.nl/mrrc/nmrzoo/ssnake) and export to a .json file.

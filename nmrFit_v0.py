@@ -96,7 +96,7 @@ from PyQt5.QtGui import QDoubleValidator
 from stats_extract import extract_FitResult_corr_and_sum
 from stats_view import StatsView
 from fit_types import ParamRef, ParamBounds
-from constraint_rules import (
+from constraint_rules_v1 import (
     CONSTRAINT_RULE_REGISTRY,
     ConstraintType,
     ConstraintRule,
@@ -106,6 +106,8 @@ from constraint_rules import (
     RelaxDecayConstraint,
     RelaxExpConstraintBase,
     RelaxGrowthConstraint,
+    JCouplingConstraint,
+    JModulationConstraint,
     ConstraintStore,
     ConstraintValidationError,
     FitOrchestrator,
@@ -282,8 +284,16 @@ class LinkManagerDialog(QtWidgets.QDialog):
             "s14_p2_amp = exp(A=1.2, T_name=Tglobal, C=0)"
         )
 
+        j_lbl = make_label(
+            "J constraints<br>"
+            "J COUPLING: driver=s0_p0_pos, J=120, order=1, sign=1, scale=1<br>"
+            "J MODULATION: driver=s0_p0_amp, J_name=Jab, T2_name=T2ab, A=1, C=0, time=0.001<br>"
+            "For J MODULATION, time can also be written as t=...; if omitted, slice time is used."
+        )
+
         hint_layout.addWidget(linear_lbl, 0, 0)
         hint_layout.addWidget(exp_lbl,    0, 1)
+        hint_layout.addWidget(j_lbl,      1, 0, 1, 2)
         hint_layout.setColumnStretch(0, 1)
         hint_layout.setColumnStretch(1, 1)
         layout.addWidget(hint_box)
@@ -334,7 +344,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
     # --------------- UI helpers ---------------
     def _norm_type(self, t: str) -> str:
         t = (t or "").strip().upper()
-        return t if t in ("LINEAR", "RELAX DECAY", "RELAX GROWTH") else "LINEAR"
+        return t if t in ("LINEAR", "RELAX DECAY", "RELAX GROWTH", "J COUPLING", "J MODULATION", "J_COUPLING", "J_MODULATION") else "LINEAR"
 
     def _target_pref_from_row(self, row: int):
         self._ensure_row_targets_len(row)
@@ -888,6 +898,19 @@ class LinkManagerDialog(QtWidgets.QDialog):
         finally:
             self.tbl.blockSignals(False)
 
+    def _ensure_J_rows_from_rule(self, rule) -> None:
+        """Ensure named J parameters used by a rule exist in MainWindow._Jseed_registry."""
+        
+        J_name = getattr(rule, "J_name", None)
+        if not isinstance(J_name, str) or not J_name.strip():
+            return
+    
+        mw = self.parent()
+        ensure = getattr(mw, "_ensure_jseed_row", None)
+    
+        if callable(ensure):
+            ensure(J_name.strip())
+
     def _try_commit_row(self, row: int) -> None:
         """
         Safe, readiness-gated commit.
@@ -1019,6 +1042,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
 
         try:
             st.add_constraint(rule)
+            self._ensure_J_rows_from_rule(rule)
         except Exception as e:
             if expr_item is not None:
                 self._mark_error(expr_item, f"Commit failed: {e}")
@@ -1430,6 +1454,7 @@ class LinkManagerDialog(QtWidgets.QDialog):
                             )
                         
                         self._constraint_store.add_constraint(constraint_rule)
+                        self._ensure_J_rows_from_rule(constraint_rule)
                         
                         # Track first occurrence of this target
                         if pref not in target_first_seen:
@@ -3385,8 +3410,109 @@ class TSeedTableDialog(QtWidgets.QDialog):
                                         [QtCore.Qt.DisplayRole])
     
 
+class JSeedTableModel(QtCore.QAbstractTableModel):
+    COLS = ["J_name", "J_seed (Hz)", "Fix", "Lo (Hz)", "Hi (Hz)", "J_result (Hz)"]
+    def __init__(self, registry: dict[str, dict], parent=None):
+        super().__init__(parent)
+        self._Jseed_registry = registry
+        self._rows = sorted(self._Jseed_registry.keys())
+
+    def refresh(self):
+        self.beginResetModel()
+        self._rows = sorted(self._Jseed_registry.keys())
+        self.endResetModel()
+
+    def rowCount(self, parent=None): return len(self._rows)
+    def columnCount(self, parent=None): return 6
+    def headerData(self, section, orient, role=QtCore.Qt.DisplayRole):
+        if role == QtCore.Qt.DisplayRole and orient == QtCore.Qt.Horizontal:
+            return self.COLS[section]
+        return None
+
+    def flags(self, index):
+        if not index.isValid(): return QtCore.Qt.NoItemFlags
+        c = index.column()
+        base = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+        if c in (1, 3, 4): base |= QtCore.Qt.ItemIsEditable
+        if c == 2: base |= QtCore.Qt.ItemIsUserCheckable
+        return base
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):
+        if not index.isValid(): return None
+        name = self._rows[index.row()]
+        rec = self._Jseed_registry.get(name, {})
+        c = index.column()
+        if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+            if c == 0: return name
+            if c == 1:
+                v = rec.get("J_seed_Hz", None)
+                return "" if v is None else (f"{float(v):.12g}" if role == QtCore.Qt.DisplayRole else float(v))
+            if c == 3:
+                v = rec.get("J_lo_Hz", None)
+                return "" if v is None else (f"{float(v):.12g}" if role == QtCore.Qt.DisplayRole else float(v))
+            if c == 4:
+                v = rec.get("J_hi_Hz", None)
+                return "" if v is None else (f"{float(v):.12g}" if role == QtCore.Qt.DisplayRole else float(v))
+            if c == 5:
+                v = rec.get("J_result_Hz", None)
+                return "" if v is None else f"{float(v):.12g}"
+        if c == 2 and role == QtCore.Qt.CheckStateRole:
+            return QtCore.Qt.Checked if bool(rec.get("fixed", False)) else QtCore.Qt.Unchecked
+        return None
+
+    def setData(self, index, value, role=QtCore.Qt.EditRole):
+        if not index.isValid(): return False
+        name = self._rows[index.row()]
+        rec = self._Jseed_registry.setdefault(name, {"fixed": False, "J_seed_Hz": None, "J_result_Hz": None})
+        c = index.column()
+        if c in (1, 3, 4) and role == QtCore.Qt.EditRole:
+            try:
+                v = float(value)
+                if c == 1: rec["J_seed_Hz"] = float(v)
+                elif c == 3: rec["J_lo_Hz"] = float(v)
+                else: rec["J_hi_Hz"] = float(v)
+                self.dataChanged.emit(index, index, [QtCore.Qt.DisplayRole, QtCore.Qt.EditRole])
+                return True
+            except Exception:
+                return False
+        if c == 2 and role == QtCore.Qt.CheckStateRole:
+            rec["fixed"] = (value == QtCore.Qt.Checked)
+            self.dataChanged.emit(index, index, [QtCore.Qt.CheckStateRole, QtCore.Qt.DisplayRole])
+            return True
+        return False
 
 
+class JSeedTableDialog(QtWidgets.QDialog):
+    def __init__(self, parent, registry: dict[str, dict]):
+        super().__init__(parent)
+        self.setWindowTitle("J seeds")
+        self.resize(520, 360)
+        self._Jseed_registry = registry
+        lay = QtWidgets.QVBoxLayout(self)
+        self.tbl = QtWidgets.QTableView(self)
+        self.model = JSeedTableModel(self._Jseed_registry, self)
+        self.tbl.setModel(self.model)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.SelectedClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.horizontalHeader().setSectionsClickable(False)
+        self.tbl.setShowGrid(False)
+        sci_delegate = ScientificDoubleDelegate(self.tbl, decimals=6)
+        for col in (1, 3, 4, 5):
+            self.tbl.setItemDelegateForColumn(col, sci_delegate)
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        lay.addWidget(self.tbl, 1)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject); btns.accepted.connect(self.accept)
+        lay.addWidget(btns)
+
+    def ensure_row(self, J_name: str):
+        if J_name not in self._Jseed_registry:
+            self._Jseed_registry[J_name] = {"fixed": False, "J_seed_Hz": 10.0, "J_result_Hz": None, "J_lo_Hz": None, "J_hi_Hz": None}
+            self.model.refresh()
 
 
 # ------------------------------ Helper ------------------------------
@@ -3498,6 +3624,7 @@ class  MainWindow( QMainWindow):
         # ---- T-seed registry (authoritative) ----
         # schema: {T_name: {"fixed": bool, "T_seed_s": float|None, "T_result_s": float|None, T_lo_s: float|None, T_hi_s: float|None}}
         self._Tseed_registry: dict[str, dict] = {}
+        self._Jseed_registry: dict[str, dict] = {}
 
         
         self._buildMainWindow() 
@@ -3649,8 +3776,10 @@ class  MainWindow( QMainWindow):
         self.btn_link_manager = QtWidgets.QPushButton("Link Manager")
         ctrls_mid.addWidget(self.btn_link_manager)
         self.btn_Tseed = QtWidgets.QPushButton("T seeds")
+        self.btn_Jseed = QtWidgets.QPushButton("J seeds")
         self.btn_copy_bounds = QtWidgets.QPushButton("Copy bounds")
         ctrls_mid.addWidget(self.btn_Tseed)
+        ctrls_mid.addWidget(self.btn_Jseed)
         ctrls_mid.addWidget(self.btn_copy_bounds)
 
 
@@ -4042,6 +4171,42 @@ class  MainWindow( QMainWindow):
             try: dlg.ensure_row(T_name)
             except Exception: pass
 
+    def _ensure_jseed_row(self, J_name: str):
+        if not J_name: return
+        if not hasattr(self, "_Jseed_registry"):
+            self._Jseed_registry = {}
+        if J_name not in self._Jseed_registry:
+            self._Jseed_registry[J_name] = {"fixed": False, "J_seed_Hz": 10.0, "J_result_Hz": None, "J_lo_Hz": None, "J_hi_Hz": None}
+        dlg = getattr(self, "_Jseed_dlg", None)
+        if dlg:
+            try: dlg.ensure_row(J_name)
+            except Exception: pass
+
+    def _ensure_J_rows_from_rule(self, rule) -> None:
+        try:
+            Jn = getattr(rule, "J_name", None)
+            if isinstance(Jn, str) and Jn.strip():
+                self._ensure_jseed_row(Jn.strip())
+            T2n = getattr(rule, "T2_name", None)
+            if isinstance(T2n, str) and T2n.strip():
+                self._ensure_tseed_row(T2n.strip())
+        except Exception:
+            pass
+
+    def _on_open_jseed_table(self):
+        dlg = getattr(self, "_Jseed_dlg", None)
+        if dlg is None:
+            dlg = JSeedTableDialog(self, self._Jseed_registry)
+            self._Jseed_dlg = dlg
+        try:
+            for _pref, rule in self.constraint_store.all_constraints():
+                J_name = getattr(rule, "J_name", None)
+                if isinstance(J_name, str) and J_name.strip():
+                    dlg.ensure_row(J_name.strip())
+            dlg.model.refresh()
+        except Exception:
+            pass
+        dlg.exec_()
 
 
     def _connect_signals(self):
@@ -4083,6 +4248,7 @@ class  MainWindow( QMainWindow):
         
         self.btn_link_manager.clicked.connect(self.on_show_link_manager)
         self.btn_Tseed.clicked.connect(self._on_open_tseed_table)
+        self.btn_Jseed.clicked.connect(self._on_open_jseed_table)
         self.btn_stat.clicked.connect(self.on_show_statistics)
 
 
@@ -5254,7 +5420,7 @@ class  MainWindow( QMainWindow):
             try:
                 store = getattr(self, 'constraint_store', None)
                 if store is not None:
-                    orchestrator = FitOrchestrator(constraint_store=store, Tseed_registry=self._Tseed_registry)
+                    orchestrator = FitOrchestrator(constraint_store=store, Tseed_registry=self._Tseed_registry, Jseed_registry=self._Jseed_registry)
             except Exception as e:
                 log.warning('Failed to initialize FitOrchestrator: %s', e) 
 
@@ -5281,6 +5447,7 @@ class  MainWindow( QMainWindow):
                         allow_external=bool(allow_external_drivers),
                         vary=bool(vary),
                         strict_external_seed=True,
+                        Jseed_registry=self._Jseed_registry,
                     )
 
                 except Exception as e:
@@ -5296,6 +5463,17 @@ class  MainWindow( QMainWindow):
                     ftol=1e-8, xtol=1e-8, gtol=1e-8, x_scale='jac', loss='soft_l1'
                 )
                 self.fit_stats = extract_FitResult_corr_and_sum(result, mode="Single Fit", slice_indices_list=[sid], ref_MHz=self.ref)
+                # Update named J results, if any J__ parameters were optimized in this fit.
+                for param_name, param_obj in result.params.items():
+                    if param_name.startswith("J__"):
+                        J_name = param_name[3:]
+                        val = param_obj.value
+                        if val is not None:
+                            rec = self._Jseed_registry.setdefault(J_name, {"fixed": False, "J_seed_Hz": None, "J_result_Hz": None})
+                            rec["J_result_Hz"] = float(val)
+                dlg = getattr(self, "_Jseed_dlg", None)
+                if dlg:
+                    dlg.model.refresh()
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, 'Fit error', str(e))
                 return  # finally{} will end_busy()
@@ -5502,7 +5680,8 @@ class  MainWindow( QMainWindow):
             if constraint_store is not None:
                 orchestrator = FitOrchestrator(
                     constraint_store=constraint_store,
-                    Tseed_registry=self._Tseed_registry
+                    Tseed_registry=self._Tseed_registry,
+                    Jseed_registry=self._Jseed_registry
                 )
         except Exception as e:
             log.warning('Failed to initialize FitOrchestrator: %s', e)
@@ -5541,6 +5720,7 @@ class  MainWindow( QMainWindow):
                         vary=True,  # Joint mode
                         strict_external_seed=True,
                         Tseed_registry=self._Tseed_registry,
+                        Jseed_registry=self._Jseed_registry,
                     )
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Constraint Application Error", str(e))
@@ -5683,6 +5863,21 @@ class  MainWindow( QMainWindow):
                             dlg.model.refresh()
                     except Exception as e:
                         print(f"Failed to process {T_name}: {e}")
+
+        # Extract J results directly from result.params (J__ parameters)
+        for param_name, param_obj in result.params.items():
+            if param_name.startswith("J__"):
+                J_name = param_name[3:]
+                val = param_obj.value
+                if val is not None:
+                    try:
+                        rec = self._Jseed_registry.setdefault(J_name, {"fixed": False, "J_seed_Hz": None, "J_result_Hz": None})
+                        rec["J_result_Hz"] = float(val)
+                        dlg = getattr(self, "_Jseed_dlg", None)
+                        if dlg:
+                            dlg.model.refresh()
+                    except Exception as e:
+                        print(f"Failed to process {J_name}: {e}")
 
         try:
             nfev = int(result.nfev)
